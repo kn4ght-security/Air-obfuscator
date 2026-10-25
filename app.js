@@ -19,6 +19,13 @@
 
   var pickedFile = null; // File object, takes priority over the textarea
   var worker = null;
+  var runBtnIdleText = runBtn.textContent;
+
+  function setProcessing(on) {
+    runBtn.disabled = on;
+    runBtn.classList.toggle("loading", on);
+    runBtn.textContent = on ? "Processing..." : runBtnIdleText;
+  }
 
   function setStatus(msg, kind) {
     statusEl.textContent = msg || "";
@@ -48,7 +55,8 @@
     setStatus("");
   }
 
-  drop.addEventListener("click", function () { fileInput.click(); });
+  // "drop" is a <label> wrapping the <input>, so a pointer click already
+  // opens the file dialog natively; only keyboard activation needs help.
   drop.addEventListener("keydown", function (e) {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
   });
@@ -79,13 +87,14 @@
     outputPanel.style.display = "none";
     setStatus("");
     showBar(false);
+    setProcessing(false);
   });
 
   function getSourceBytes(cb) {
     if (pickedFile) {
       var reader = new FileReader();
       reader.onload = function () { cb(new Uint8Array(reader.result)); };
-      reader.onerror = function () { setStatus("Could not read that file.", "err"); runBtn.disabled = false; };
+      reader.onerror = function () { setStatus("Could not read that file.", "err"); setProcessing(false); };
       reader.readAsArrayBuffer(pickedFile);
       return;
     }
@@ -95,7 +104,7 @@
   }
 
   runBtn.addEventListener("click", function () {
-    runBtn.disabled = true;
+    setProcessing(true);
     outputPanel.style.display = "none";
     showBar(true);
     setStatus("Reading source...");
@@ -103,34 +112,71 @@
     getSourceBytes(function (bytes) {
       if (bytes.byteLength > MAX_BYTES) {
         setStatus("That's " + fmtSize(bytes.byteLength) + ". The limit is 40 MB.", "err");
-        runBtn.disabled = false;
+        setProcessing(false);
         showBar(false);
         return;
       }
-      if (worker) worker.terminate();
-      worker = new Worker("worker.js");
+      function finish(result) {
+        showBar(false);
+        setProcessing(false);
+        setStatus("Obfuscated " + fmtSize(bytes.byteLength) + " of source.", "ok");
+        output.textContent = result;
+        outputPanel.style.display = "block";
+        outputPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+      function fail(msg) {
+        showBar(false);
+        setProcessing(false);
+        setStatus("Failed: " + msg, "err");
+      }
+
+      // runs on the main thread when a Worker can't be used (e.g. the page
+      // was opened as a local file:// page, which some browsers block workers on)
+      function runWithoutWorker(reason) {
+        setStatus((reason ? reason + " \u2014 " : "") + "running without a background worker...");
+        setTimeout(function () {
+          try {
+            var result = self.ObfuscateCore.obfuscate(bytes, function (p, label) {
+              barFill.style.width = Math.round(p * 100) + "%";
+            });
+            finish(result);
+          } catch (err) {
+            fail(String((err && err.message) || err));
+          }
+        }, 30);
+      }
+
+      var canUseWorker = typeof Worker !== "undefined" && window.location.protocol !== "file:";
+      if (!canUseWorker) {
+        runWithoutWorker(
+          window.location.protocol === "file:"
+            ? "Can't start a background worker from a local file"
+            : "Background workers aren't available here"
+        );
+        return;
+      }
+
+      try {
+        if (worker) worker.terminate();
+        worker = new Worker("worker.js");
+      } catch (err) {
+        runWithoutWorker("Couldn't start a background worker");
+        return;
+      }
+
       worker.onmessage = function (e) {
         var msg = e.data;
         if (msg.type === "progress") {
           barFill.style.width = Math.round(msg.progress * 100) + "%";
           setStatus(msg.label);
         } else if (msg.type === "done") {
-          showBar(false);
-          runBtn.disabled = false;
-          setStatus("Obfuscated " + fmtSize(bytes.byteLength) + " of source.", "ok");
-          output.textContent = msg.result;
-          outputPanel.style.display = "block";
-          outputPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          finish(msg.result);
         } else if (msg.type === "error") {
-          showBar(false);
-          runBtn.disabled = false;
-          setStatus("Failed: " + msg.error, "err");
+          fail(msg.error);
         }
       };
-      worker.onerror = function (err) {
-        showBar(false);
-        runBtn.disabled = false;
-        setStatus("Worker error: " + err.message, "err");
+      worker.onerror = function () {
+        runWithoutWorker("Background worker failed to load");
       };
       // transfer the buffer so a big file doesn't get copied twice
       var buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);

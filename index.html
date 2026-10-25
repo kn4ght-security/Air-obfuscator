@@ -13,11 +13,10 @@
 <div class="wrap">
   <header>
     <strong>Air Obfuscator</strong>
-    <span class="tag">runs entirely in your browser</span>
   </header>
 
   <h1>Obfuscate a Luau script</h1>
-  <p class="lead">Drop a .lua file or paste code below. It is encoded in two layers with a checksum, so a corrupted or tampered file refuses to run. Files up to 40&nbsp;MB. Nothing leaves your browser.</p>
+  <p class="lead">Upload a .lua file, or paste code below. Runs in your browser — nothing is uploaded anywhere.</p>
 
   <div class="panel">
     <label class="drop" id="drop" tabindex="0">
@@ -48,16 +47,12 @@
     </div>
     <pre id="output"></pre>
   </div>
-
-  <p class="note">
-    Obfuscation makes a script harder to read, not impossible. A determined person can still deobfuscate it.
-    The output calls <code>loadstring</code> or <code>load</code>, so it won't run in plain Lua sandboxes that block them.
-  </p>
 </div>
 
-<footer>Air Obfuscator &middot; client-side only, no data is sent anywhere</footer>
+<footer>Air Obfuscator</footer>
 
 <script src="snow.js"></script>
+<script src="obfuscate-core.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

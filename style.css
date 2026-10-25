@@ -25,20 +25,16 @@ a { color: var(--accent); }
 
 .wrap { position: relative; z-index: 1; max-width: 760px; margin: 0 auto; padding: 0 20px 80px; }
 
-header { padding: 28px 0 8px; display: flex; align-items: center; justify-content: space-between; }
+header { padding: 28px 0 8px; }
 header strong { font-size: 18px; letter-spacing: 0.2px; }
-header .tag { color: var(--sub); font-size: 13px; }
 
 h1 {
-  font-size: clamp(32px, 6vw, 44px);
-  line-height: 1.15;
-  margin: 40px 0 10px;
-  background: linear-gradient(100deg, #fff 10%, var(--accent) 60%, var(--accent2) 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  font-size: clamp(28px, 5vw, 36px);
+  line-height: 1.2;
+  margin: 32px 0 10px;
+  color: var(--text);
 }
-.lead { color: var(--sub); max-width: 56ch; font-size: 16px; margin: 0 0 36px; }
+.lead { color: var(--sub); max-width: 56ch; font-size: 16px; margin: 0 0 28px; }
 
 .panel {
   background: var(--panel);
@@ -93,6 +89,25 @@ button.primary {
   cursor: pointer;
 }
 button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary.loading {
+  opacity: 0.85;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+button.primary.loading::before {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid rgba(10, 13, 24, 0.35);
+  border-top-color: #0a0d18;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button.primary.loading::before { animation: none; }
+}
 button.secondary {
   background: var(--card);
   color: var(--text);

@@ -6,7 +6,7 @@
 
   var ctx = canvas.getContext("2d");
   var flakes = [];
-  var count = 70;
+  var count = 40;
   var w, h;
 
   function resize() {
