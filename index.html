@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luau Obfuscator</title>
+<meta name="description" content="Obfuscate a Luau script in your browser. Nothing is uploaded anywhere.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="snow" aria-hidden="true"></canvas>
+
+<div class="wrap">
+  <header>
+    <strong>Luau Obfuscator</strong>
+    <span class="tag">runs entirely in your browser</span>
+  </header>
+
+  <h1>Obfuscate a Luau script</h1>
+  <p class="lead">Drop a .lua file or paste code below. It is encoded in two layers with a checksum, so a corrupted or tampered file refuses to run. Files up to 40&nbsp;MB. Nothing leaves your browser.</p>
+
+  <div class="panel">
+    <label class="drop" id="drop" tabindex="0">
+      <input type="file" id="file" accept=".lua,.txt,text/plain" />
+      <p class="big">Drop a .lua file here, or click to browse</p>
+      <p class="small">Max size 40 MB</p>
+    </label>
+    <div class="file-info" id="fileInfo" style="display:none;">
+      <span id="fileName"></span>
+      <button type="button" id="clearFile">Remove</button>
+    </div>
+
+    <p class="or">or paste code</p>
+    <textarea id="code" placeholder='print("Hello, Luau!")'></textarea>
+
+    <div class="row">
+      <button class="primary" id="run">Obfuscate</button>
+      <button class="secondary" id="reset" type="button">Clear</button>
+    </div>
+    <div class="bar" id="bar"><div id="barFill"></div></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="panel output" id="outputPanel" style="display:none;">
+    <div class="row" style="margin-top:0;">
+      <button class="secondary" id="copy">Copy output</button>
+      <button class="secondary" id="download">Download .lua</button>
+    </div>
+    <pre id="output"></pre>
+  </div>
+
+  <p class="note">
+    Obfuscation makes a script harder to read, not impossible. A determined person can still deobfuscate it.
+    The output calls <code>loadstring</code> or <code>load</code>, so it won't run in plain Lua sandboxes that block them.
+  </p>
+</div>
+
+<footer>Luau Obfuscator &middot; client-side only, no data is sent anywhere</footer>
+
+<script src="snow.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
