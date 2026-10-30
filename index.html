@@ -19,6 +19,13 @@
   <p class="lead">Upload a .lua file, or paste code below. Runs in your browser — nothing is uploaded anywhere.</p>
 
   <div class="panel">
+    <label class="field" for="protection">Protection</label>
+    <select id="protection">
+      <option value="plain" selected>Standard</option>
+      <option value="cff">Control-flow flattening (CFF)</option>
+      <option value="vm">VM (bytecode)</option>
+    </select>
+
     <label class="drop" id="drop" tabindex="0">
       <input type="file" id="file" accept=".lua,.txt,text/plain" />
       <p class="big">Drop a .lua file here, or click to browse</p>

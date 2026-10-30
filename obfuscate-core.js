@@ -1,6 +1,7 @@
 // port of the Luau VM test encoder: three XOR-style layers, shuffled chunk
-// storage and a checksum guard. shared by worker.js (background) and app.js
-// (fallback when a worker can't be created)
+// storage, a checksum guard, plus optional control-flow flattening or a
+// tiny bytecode VM for the final load/run sequence.
+// shared by worker.js (background) and app.js (fallback when a worker can't be created)
 
 var MOD = 2147483647;
 
@@ -69,32 +70,74 @@ function junkLines(used, count) {
   var out = [];
   for (var i = 0; i < count; i++) {
     var name = uglyName(used);
-    if (Math.random() < 0.5) {
-      out.push("local " + name + " = " + randInt(10000, 99999999));
-    } else {
+    var r = Math.random();
+    if (r < 0.4) {
+      out.push("local " + name + " = " + numExpr(randInt(10000, 99999999)));
+    } else if (r < 0.7) {
+      // letters
       var s = "";
       var len = randInt(4, 10);
       for (var k = 0; k < len; k++) s += String.fromCharCode(randInt(97, 122));
       out.push('local ' + name + ' = "' + s + '"');
+    } else {
+      // mixed letters + symbols, pure noise, never read back
+      var s2 = "";
+      var len2 = randInt(5, 12);
+      for (var k2 = 0; k2 < len2; k2++) {
+        s2 += Math.random() < 0.5
+          ? String.fromCharCode(randInt(97, 122))
+          : JUNK_SYMBOLS[randInt(0, JUNK_SYMBOLS.length - 1)];
+      }
+      out.push('local ' + name + ' = "' + s2 + '"');
     }
   }
   return out;
 }
 
-function obfuscate(srcBytes, report) {
+// render an integer as itself or as a small +,-,* expression that evaluates
+// to the exact same value (never division, to avoid any float drift) — pure
+// cosmetic noise over literals used for keys/steps/checksums/ids
+function numExpr(n) {
+  if (Math.abs(n) < 4 || Math.random() < 0.3) return String(n);
+  var mode = randInt(0, 2);
+  if (mode === 0) {
+    var a = randInt(1, Math.min(9999, Math.abs(n) + 500));
+    var b = n - a;
+    return "(" + a + (b >= 0 ? " + " + b : " - " + -b) + ")";
+  }
+  if (mode === 1) {
+    var a2 = n + randInt(1, 500);
+    var b2 = a2 - n;
+    return "(" + a2 + " - " + b2 + ")";
+  }
+  var d = randInt(2, 9);
+  var q = Math.trunc(n / d);
+  var rem = n - q * d;
+  return "(" + q + " * " + d + (rem >= 0 ? " + " + rem : " - " + -rem) + ")";
+}
+
+// symbol set for decoy string junk; backslash/quote excluded since they'd
+// need escaping and add nothing — everything else is fair game
+var JUNK_SYMBOLS = "!@#$%^&*-_=+[]{};:,.<>?~";
+
+function randomDistinctInts(count, min, max) {
+  var set = new Set();
+  while (set.size < count) set.add(randInt(min, max));
+  return Array.from(set);
+}
+
+// --- shared: chunk table + decode function ---------------------------------
+
+function buildDataSetup(srcBytes) {
   var keyOne = randInt(1, 255), stepOne = randInt(1, 255);
   var keyTwo = randInt(1, 255), stepTwo = randInt(1, 255);
   var keyThree = randInt(1, 255), stepThree = randInt(1, 255);
 
-  report(0.05, "Encoding layer 1...");
   var stageOne = encodeLayer(srcBytes, keyOne, stepOne);
-  report(0.25, "Encoding layer 2...");
   var stageTwo = encodeLayer(stageOne, keyTwo, stepTwo);
-  report(0.4, "Encoding layer 3...");
   var stageThree = encodeLayer(stageTwo, keyThree, stepThree);
 
-  report(0.55, "Splitting and shuffling chunks...");
-  var boundaries = []; // [start, end) in logical (sequential) order
+  var boundaries = [];
   var cursor = 0;
   while (cursor < stageThree.length) {
     var size = randInt(96, 220);
@@ -103,9 +146,9 @@ function obfuscate(srcBytes, report) {
     cursor = end;
   }
   var n = boundaries.length;
-  var order = shuffledIndices(n); // order[k] = which logical chunk sits at physical slot k
+  var order = shuffledIndices(n);
   var chunkLiterals = new Array(n);
-  var physicalSlotOfLogical = new Array(n); // inverse of `order`
+  var physicalSlotOfLogical = new Array(n);
   for (var k = 0; k < n; k++) {
     var logical = order[k];
     var b = boundaries[logical];
@@ -113,7 +156,6 @@ function obfuscate(srcBytes, report) {
     physicalSlotOfLogical[logical] = k;
   }
 
-  report(0.75, "Checksums & loader...");
   var used = new Set();
   var varChunks = uglyName(used);
   var varEncoded = uglyName(used);
@@ -128,27 +170,14 @@ function obfuscate(srcBytes, report) {
   var varByte = uglyName(used);
   var varDecoded = uglyName(used);
   var varCheck = uglyName(used);
-  var varStageOne = uglyName(used);
-  var varStageTwo = uglyName(used);
-  var varSource = uglyName(used);
-  var varLoader = uglyName(used);
-  var varCompileError = uglyName(used);
 
-  // varChunks[physicalSlot+1] in logical order, joined with .. so the stored
-  // table order (shuffled) never matches the order bytes are actually used in
   var reassembleParts = [];
   for (var j = 0; j < n; j++) {
     reassembleParts.push(varChunks + "[" + (physicalSlotOfLogical[j] + 1) + "]");
   }
   var reassembleExpr = reassembleParts.join(" .. ");
 
-  var checksumStageTwo = checksumOf(stageTwo);
-  var checksumStageOne = checksumOf(stageOne);
-  var checksumSrc = checksumOf(srcBytes);
-
-  var lines = [
-    "-- this file was protected by Air Obfuscator",
-  ];
+  var lines = ["-- this file was protected by Air Obfuscator"];
   lines = lines.concat(junkLines(used, randInt(2, 4)));
   lines.push(
     "local " + varChunks + " = {" + chunkLiterals.join(",") + "}",
@@ -172,16 +201,159 @@ function obfuscate(srcBytes, report) {
     "  return table.concat(" + varOut + ")",
     "end"
   );
-  lines = lines.concat(junkLines(used, randInt(1, 3)));
-  lines.push(
-    "local " + varStageTwo + " = " + varDecode + "(" + varEncoded + "," + keyThree + "," + stepThree + "," + checksumStageTwo + ")",
-    "local " + varStageOne + " = " + varDecode + "(" + varStageTwo + "," + keyTwo + "," + stepTwo + "," + checksumStageOne + ")",
-    "local " + varSource + " = " + varDecode + "(" + varStageOne + "," + keyOne + "," + stepOne + "," + checksumSrc + ")",
-    "local " + varLoader + ", " + varCompileError + " = (loadstring or load)(" + varSource + ")",
-    "if not " + varLoader + " then error('[air] compile failed: ' .. tostring(" + varCompileError + "), 0) end",
-    varLoader + "()"
-  );
 
+  // the 3 decode calls (outer -> inner) + load + run, as an ordered step list
+  // consumed by whichever renderer (plain / cff / vm) is selected
+  var steps = [
+    { kind: "decode", key: keyThree, step: stepThree, expected: checksumOf(stageTwo), srcName: varEncoded },
+    { kind: "decode", key: keyTwo, step: stepTwo, expected: checksumOf(stageOne), srcName: null },
+    { kind: "decode", key: keyOne, step: stepOne, expected: checksumOf(srcBytes), srcName: null },
+    { kind: "load" },
+    { kind: "check" },
+    { kind: "call" },
+  ];
+
+  return { lines: lines, used: used, varDecode: varDecode, steps: steps };
+}
+
+// --- renderer: plain (straight-line, as before) -----------------------------
+
+function renderPlain(setup) {
+  var used = setup.used;
+  var varDecode = setup.varDecode;
+  var steps = setup.steps;
+  var varStageTwo = uglyName(used);
+  var varStageOne = uglyName(used);
+  var varSource = uglyName(used);
+  var varLoader = uglyName(used);
+  var varErr = uglyName(used);
+
+  var s0 = steps[0], s1 = steps[1], s2 = steps[2];
+  var out = [];
+  out.push("local " + varStageTwo + " = " + varDecode + "(" + s0.srcName + "," + numExpr(s0.key) + "," + numExpr(s0.step) + "," + numExpr(s0.expected) + ")");
+  out.push("local " + varStageOne + " = " + varDecode + "(" + varStageTwo + "," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + ")");
+  out.push("local " + varSource + " = " + varDecode + "(" + varStageOne + "," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + ")");
+  out.push("local " + varLoader + ", " + varErr + " = (loadstring or load)(" + varSource + ")");
+  out.push("if not " + varLoader + " then error('[air] compile failed: ' .. tostring(" + varErr + "), 0) end");
+  out.push(varLoader + "()");
+  return out;
+}
+
+// --- renderer: CFF (control-flow flattening) --------------------------------
+// the same 6 steps, but driven by a state variable through a dispatch loop;
+// the if/elseif branches are written out in a shuffled order in the source,
+// so reading the file top to bottom does not show the real execution order.
+
+function renderCFF(setup) {
+  var used = setup.used;
+  var varDecode = setup.varDecode;
+  var steps = setup.steps;
+  var varStageTwo = uglyName(used);
+  var varStageOne = uglyName(used);
+  var varSource = uglyName(used);
+  var varLoader = uglyName(used);
+  var varErr = uglyName(used);
+  var varState = uglyName(used);
+
+  var s0 = steps[0], s1 = steps[1], s2 = steps[2];
+  // locals declared in one state must still be visible in later states, so
+  // hoist them above the loop and assign (not `local`) inside each branch
+  var hoisted = [varStageTwo, varStageOne, varSource, varLoader, varErr];
+  var bodies = [
+    "    " + varStageTwo + " = " + varDecode + "(" + s0.srcName + "," + numExpr(s0.key) + "," + numExpr(s0.step) + "," + numExpr(s0.expected) + ")",
+    "    " + varStageOne + " = " + varDecode + "(" + varStageTwo + "," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + ")",
+    "    " + varSource + " = " + varDecode + "(" + varStageOne + "," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + ")",
+    "    " + varLoader + ", " + varErr + " = (loadstring or load)(" + varSource + ")",
+    "    if not " + varLoader + " then error('[air] compile failed: ' .. tostring(" + varErr + "), 0) end",
+    "    " + varLoader + "()",
+  ];
+
+  var n = bodies.length;
+  var stateIds = randomDistinctInts(n, 1000, 999999); // state id per logical step, in order
+  var order = shuffledIndices(n); // emission order of the if/elseif branches in the source
+
+  var out = [];
+  out.push("local " + hoisted.join(", "));
+  out.push("local " + varState + " = " + numExpr(stateIds[0]));
+  out.push("while " + varState + " ~= 0 do");
+  for (var k = 0; k < n; k++) {
+    var logical = order[k];
+    var nextState = logical + 1 < n ? stateIds[logical + 1] : 0;
+    out.push((k === 0 ? "  if " : "  elseif ") + varState + " == " + numExpr(stateIds[logical]) + " then");
+    out.push(bodies[logical]);
+    out.push("    " + varState + " = " + numExpr(nextState));
+  }
+  out.push("  end");
+  out.push("end");
+  return out;
+}
+
+// --- renderer: VM (tiny bytecode interpreter) -------------------------------
+// the 6 steps become instructions in a program table, run by a small
+// register-machine interpreter; opcode numbers are randomized per build.
+
+function renderVM(setup) {
+  var used = setup.used;
+  var varDecode = setup.varDecode;
+  var steps = setup.steps;
+  var varR = uglyName(used);       // register table
+  var varProg = uglyName(used);    // program (instruction list)
+  var varPc = uglyName(used);      // program counter
+  var varIns = uglyName(used);     // current instruction
+  var varOp = uglyName(used);      // current opcode
+
+  var opIds = randomDistinctInts(4, 10, 250);
+  var OP_DECODE = opIds[0], OP_LOAD = opIds[1], OP_CHECK = opIds[2], OP_CALL = opIds[3];
+
+  // fixed register roles: 1=encoded(stageThree) 2=stageTwo 3=stageOne
+  // 4=source 5=loaderFn 6=err
+  var s0 = steps[0], s1 = steps[1], s2 = steps[2];
+  var out = [];
+  out.push("local " + varR + " = {}");
+  out.push(varR + "[1] = " + s0.srcName);
+  out.push("local " + varProg + " = {");
+  out.push("  {" + OP_DECODE + ",2,1," + numExpr(s0.key) + "," + numExpr(s0.step) + "," + numExpr(s0.expected) + "},");
+  out.push("  {" + OP_DECODE + ",3,2," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + "},");
+  out.push("  {" + OP_DECODE + ",4,3," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + "},");
+  out.push("  {" + OP_LOAD + ",5,6,4},");
+  out.push("  {" + OP_CHECK + ",5,6},");
+  out.push("  {" + OP_CALL + ",5},");
+  out.push("}");
+  out.push("local " + varPc + " = 1");
+  out.push("while " + varProg + "[" + varPc + "] do");
+  out.push("  local " + varIns + " = " + varProg + "[" + varPc + "]");
+  out.push("  local " + varOp + " = " + varIns + "[1]");
+  out.push("  if " + varOp + " == " + numExpr(OP_DECODE) + " then");
+  out.push("    " + varR + "[" + varIns + "[2]] = " + varDecode + "(" + varR + "[" + varIns + "[3]]," + varIns + "[4]," + varIns + "[5]," + varIns + "[6])");
+  out.push("  elseif " + varOp + " == " + numExpr(OP_LOAD) + " then");
+  out.push("    " + varR + "[" + varIns + "[2]], " + varR + "[" + varIns + "[3]] = (loadstring or load)(" + varR + "[" + varIns + "[4]])");
+  out.push("  elseif " + varOp + " == " + numExpr(OP_CHECK) + " then");
+  out.push("    if not " + varR + "[" + varIns + "[2]] then error('[air] compile failed: ' .. tostring(" + varR + "[" + varIns + "[3]]), 0) end");
+  out.push("  elseif " + varOp + " == " + numExpr(OP_CALL) + " then");
+  out.push("    " + varR + "[" + varIns + "[2]]()");
+  out.push("  end");
+  out.push("  " + varPc + " = " + varPc + " + 1");
+  out.push("end");
+  return out;
+}
+
+// mode: "plain" (default) | "cff" | "vm"
+function obfuscate(srcBytes, report, mode) {
+  mode = mode || "plain";
+  report(0.05, "Encoding layer 1...");
+  report(0.25, "Encoding layer 2...");
+  report(0.4, "Encoding layer 3...");
+  var setup = buildDataSetup(srcBytes);
+
+  report(0.6, "Splitting and shuffling chunks...");
+  report(0.75, mode === "cff" ? "Flattening control flow..." : mode === "vm" ? "Building bytecode VM..." : "Writing loader...");
+
+  var tail;
+  if (mode === "cff") tail = renderCFF(setup);
+  else if (mode === "vm") tail = renderVM(setup);
+  else tail = renderPlain(setup);
+
+  var lines = setup.lines.concat(junkLines(setup.used, randInt(1, 3))).concat(tail);
   report(1, "Done");
   return lines.join("\n");
 }

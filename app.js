@@ -16,6 +16,7 @@
   var output = document.getElementById("output");
   var copyBtn = document.getElementById("copy");
   var downloadBtn = document.getElementById("download");
+  var protectionSel = document.getElementById("protection");
 
   var pickedFile = null; // File object, takes priority over the textarea
   var worker = null;
@@ -138,7 +139,7 @@
           try {
             var result = self.ObfuscateCore.obfuscate(bytes, function (p, label) {
               barFill.style.width = Math.round(p * 100) + "%";
-            });
+            }, protectionSel.value);
             finish(result);
           } catch (err) {
             fail(String((err && err.message) || err));
@@ -180,7 +181,7 @@
       };
       // transfer the buffer so a big file doesn't get copied twice
       var buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      worker.postMessage({ buffer: buf }, [buf]);
+      worker.postMessage({ buffer: buf, mode: protectionSel.value }, [buf]);
     });
   });
 
