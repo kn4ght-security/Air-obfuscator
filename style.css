@@ -157,5 +157,14 @@ button.secondary:hover { background: var(--card-hover); }
 .note code { background: var(--card); padding: 1px 5px; border-radius: 4px; }
 
 footer { position: relative; z-index: 1; text-align: center; color: var(--sub); font-size: 13px; padding: 20px; }
+footer a { color: var(--sub); text-decoration: underline; margin: 0 6px; }
+footer a:hover { color: var(--text); }
+
+.article h2 { font-size: 19px; margin: 32px 0 8px; color: var(--text); }
+.article p, .article li { color: var(--sub); max-width: 68ch; font-size: 15px; }
+.article ul { padding-left: 20px; }
+.article li { margin: 6px 0; }
+.updated { color: var(--sub); font-size: 13px; margin: 0 0 28px; }
+.back { display: inline-block; margin-top: 10px; font-size: 14px; }
 
 @media (prefers-reduced-motion: reduce) { #snow { display: none; } }
