@@ -292,11 +292,17 @@ function renderCFF(setup) {
 // the 6 steps become instructions in a program table, run by a small
 // register-machine interpreter; opcode numbers are randomized per build.
 
+// VM renderer — a small register-based interpreter in the same shape as a
+// real bytecode VM: named instruction fields (op/a/b/c/d/e, not positional
+// indices), a register file, and an ISA name table. It only ever runs our
+// own fixed 6-instruction loader program (reassemble -> decode x3 -> load ->
+// call); it does not compile or virtualize the user's actual script.
 function renderVM(setup) {
   var used = setup.used;
   var varDecode = setup.varDecode;
   var steps = setup.steps;
-  var varR = uglyName(used);       // register table
+  var varISA = uglyName(used);     // opcode name table (ISA.NAME equivalent)
+  var varR = uglyName(used);       // register file
   var varProg = uglyName(used);    // program (instruction list)
   var varPc = uglyName(used);      // program counter
   var varIns = uglyName(used);     // current instruction
@@ -309,28 +315,31 @@ function renderVM(setup) {
   // 4=source 5=loaderFn 6=err
   var s0 = steps[0], s1 = steps[1], s2 = steps[2];
   var out = [];
+  out.push("local " + varISA + " = {[" + OP_DECODE + "]='DECODE',[" + OP_LOAD + "]='LOADSTRING',[" + OP_CHECK + "]='CHECK',[" + OP_CALL + "]='CALL'}");
   out.push("local " + varR + " = {}");
   out.push(varR + "[1] = " + s0.srcName);
   out.push("local " + varProg + " = {");
-  out.push("  {" + OP_DECODE + ",2,1," + numExpr(s0.key) + "," + numExpr(s0.step) + "," + numExpr(s0.expected) + "},");
-  out.push("  {" + OP_DECODE + ",3,2," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + "},");
-  out.push("  {" + OP_DECODE + ",4,3," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + "},");
-  out.push("  {" + OP_LOAD + ",5,6,4},");
-  out.push("  {" + OP_CHECK + ",5,6},");
-  out.push("  {" + OP_CALL + ",5},");
+  out.push("  {op=" + OP_DECODE + ",a=2,b=1,c=" + numExpr(s0.key) + ",d=" + numExpr(s0.step) + ",e=" + numExpr(s0.expected) + "},");
+  out.push("  {op=" + OP_DECODE + ",a=3,b=2,c=" + numExpr(s1.key) + ",d=" + numExpr(s1.step) + ",e=" + numExpr(s1.expected) + "},");
+  out.push("  {op=" + OP_DECODE + ",a=4,b=3,c=" + numExpr(s2.key) + ",d=" + numExpr(s2.step) + ",e=" + numExpr(s2.expected) + "},");
+  out.push("  {op=" + OP_LOAD + ",a=5,b=6,c=4},");
+  out.push("  {op=" + OP_CHECK + ",a=5,b=6},");
+  out.push("  {op=" + OP_CALL + ",a=5},");
   out.push("}");
   out.push("local " + varPc + " = 1");
   out.push("while " + varProg + "[" + varPc + "] do");
   out.push("  local " + varIns + " = " + varProg + "[" + varPc + "]");
-  out.push("  local " + varOp + " = " + varIns + "[1]");
+  out.push("  local " + varOp + " = " + varIns + ".op");
   out.push("  if " + varOp + " == " + numExpr(OP_DECODE) + " then");
-  out.push("    " + varR + "[" + varIns + "[2]] = " + varDecode + "(" + varR + "[" + varIns + "[3]]," + varIns + "[4]," + varIns + "[5]," + varIns + "[6])");
+  out.push("    " + varR + "[" + varIns + ".a] = " + varDecode + "(" + varR + "[" + varIns + ".b]," + varIns + ".c," + varIns + ".d," + varIns + ".e)");
   out.push("  elseif " + varOp + " == " + numExpr(OP_LOAD) + " then");
-  out.push("    " + varR + "[" + varIns + "[2]], " + varR + "[" + varIns + "[3]] = (loadstring or load)(" + varR + "[" + varIns + "[4]])");
+  out.push("    " + varR + "[" + varIns + ".a], " + varR + "[" + varIns + ".b] = (loadstring or load)(" + varR + "[" + varIns + ".c])");
   out.push("  elseif " + varOp + " == " + numExpr(OP_CHECK) + " then");
-  out.push("    if not " + varR + "[" + varIns + "[2]] then error('[air] compile failed: ' .. tostring(" + varR + "[" + varIns + "[3]]), 0) end");
+  out.push("    if not " + varR + "[" + varIns + ".a] then error('[air] compile failed (' .. tostring(" + varISA + "[" + varOp + "]) .. '): ' .. tostring(" + varR + "[" + varIns + ".b]), 0) end");
   out.push("  elseif " + varOp + " == " + numExpr(OP_CALL) + " then");
-  out.push("    " + varR + "[" + varIns + "[2]]()");
+  out.push("    " + varR + "[" + varIns + ".a]()");
+  out.push("  else");
+  out.push("    error('[air] unimplemented opcode ' .. tostring(" + varOp + "))");
   out.push("  end");
   out.push("  " + varPc + " = " + varPc + " + 1");
   out.push("end");
