@@ -94,12 +94,15 @@ function junkLines(used, count) {
   return out;
 }
 
-// render an integer as itself or as a small +,-,* expression that evaluates
-// to the exact same value (never division, to avoid any float drift) — pure
-// cosmetic noise over literals used for keys/steps/checksums/ids
+// render an integer as itself or as an expression that evaluates to the
+// exact same value — cosmetic noise over literals used for keys/steps/
+// checksums/ids, and (via protectLiterals) the user's own number literals.
+// 5 modes, 2 of them (zero-product / mul-div) catph-style anti-dump patterns:
+// a bytecode constant dumper just sees a pile of unrelated-looking integers
+// per obfuscated literal instead of one constant that equals the real value.
 function numExpr(n) {
   if (Math.abs(n) < 4 || Math.random() < 0.3) return String(n);
-  var mode = randInt(0, 2);
+  var mode = randInt(0, n > 0 ? 4 : 3);
   if (mode === 0) {
     var a = randInt(1, Math.min(9999, Math.abs(n) + 500));
     var b = n - a;
@@ -110,10 +113,26 @@ function numExpr(n) {
     var b2 = a2 - n;
     return "(" + a2 + " - " + b2 + ")";
   }
-  var d = randInt(2, 9);
-  var q = Math.trunc(n / d);
-  var rem = n - q * d;
-  return "(" + q + " * " + d + (rem >= 0 ? " + " + rem : " - " + -rem) + ")";
+  if (mode === 2) {
+    var d = randInt(2, 9);
+    var q = Math.trunc(n / d);
+    var rem = n - q * d;
+    return "(" + q + " * " + d + (rem >= 0 ? " + " + rem : " - " + -rem) + ")";
+  }
+  if (mode === 3) {
+    // zero-product shield: (((A ^ B) + C) * 0) + n — A, B, C are random,
+    // A^B+C is a large finite float computed at runtime, * 0 collapses it
+    // to exactly 0 (IEEE-754: finite * 0 = 0), leaving n. A reader has to
+    // evaluate the whole exponent subtree just to confirm it's inert.
+    var A = randInt(100, 0xffff), B = randInt(2, 12), C = randInt(1, 0xffff);
+    return "((((" + A + " ^ " + B + ") + " + C + ") * 0) + " + n + ")";
+  }
+  // mode 4 (n > 0 only): multiply/divide cancellation, n*K / K. K is kept
+  // small enough relative to n that n*K stays well inside the 2^53 exact-
+  // integer range for doubles, so the division has no rounding drift.
+  var kMax = Math.max(2, Math.min(32, Math.floor(0xffffff / (n + 1))));
+  var K = randInt(2, kMax);
+  return "((" + n + " * " + K + ") / " + K + ")";
 }
 
 // symbol set for decoy string junk; backslash/quote excluded since they'd
@@ -287,6 +306,55 @@ function protectLiterals(src, used) {
   return decoderDef + body;
 }
 
+// --- runtime anti-tamper prelude --------------------------------------------
+// A layer on top of the existing checksum guard (which only catches corrupted
+// *bytes*). This verifies the handful of functions the decoder itself leans
+// on — pcall/error/table.unpack — still behave the way Lua defines them,
+// before any decoding happens. If something upstream has patched pcall to
+// swallow errors, or error() to not actually raise, the checksum check could
+// be bypassed entirely; this catches that class of tamper instead.
+// Deliberately NOT included: anything that fingerprints debuggers/hookers
+// (hooked-function scans, getregistry probing, physics-FPS checks, request
+// stack-depth probing) — this only asserts the script's own dependencies are
+// intact, it doesn't try to detect or punish someone inspecting the script.
+
+function buildAntiTamperPrelude(used) {
+  var pcallName = uglyName(used);
+  var errName = uglyName(used);
+  var selName = uglyName(used);
+  var unpackName = uglyName(used);
+  var validName = uglyName(used);
+  var trials = randInt(10, 18);
+
+  return [
+    "local " + pcallName + " = pcall",
+    "local " + errName + " = error",
+    "local " + selName + " = select",
+    "local " + unpackName + " = table.unpack or unpack",
+    "do",
+    "  local " + validName + " = true",
+    "  for _i = 1, " + numExpr(trials) + " do",
+    "    local _shouldErr = (_i % 2 == 0)",
+    "    local _msg = 'air_at_' .. _i",
+    "    local _arr = { " + pcallName + "(function()",
+    "      if _shouldErr then " + errName + "(_msg, 0) end",
+    "      return " + unpackName + "({ _i, _i * 2, _i * 3 })",
+    "    end) }",
+    "    local _n = " + selName + "('#', " + unpackName + "(_arr))",
+    "    if _shouldErr then",
+    "      " + validName + " = " + validName + " and (_arr[1] == false) and (_arr[2] == _msg) and (_n == 2)",
+    "    else",
+    "      " + validName + " = " + validName + " and (_arr[1] == true) and (_arr[2] == _i) and (_arr[3] == _i * 2) and (_arr[4] == _i * 3) and (_n == 4)",
+    "    end",
+    "  end",
+    "  if (0 / 0) == (0 / 0) then " + validName + " = false end",
+    "  if not " + validName + " then",
+    "    " + errName + "('[air] runtime integrity check failed', 0)",
+    "  end",
+    "end",
+  ];
+}
+
 // --- shared: chunk table + decode function ---------------------------------
 
 function buildDataSetup(srcBytes) {
@@ -373,6 +441,9 @@ function buildDataSetup(srcBytes) {
     { kind: "check" },
     { kind: "call" },
   ];
+
+  var atLines = buildAntiTamperPrelude(used);
+  lines.splice.apply(lines, [1, 0].concat(atLines));
 
   return { lines: lines, used: used, varDecode: varDecode, steps: steps };
 }
@@ -551,6 +622,7 @@ function renderVM2(srcBytes, report) {
   }
 
   var out = ["-- protected by Air Obfuscator | VM Encode v2"];
+  out = out.concat(buildAntiTamperPrelude(used));
   // Inert noise is kept separate from the decoder and never affects execution.
   out = out.concat(junkLines(used, randInt(12, 20)));
   for (var dt = 0, dtn = randInt(1, 3); dt < dtn; dt++) {
