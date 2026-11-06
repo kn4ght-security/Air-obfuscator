@@ -126,6 +126,167 @@ function randomDistinctInts(count, min, max) {
   return Array.from(set);
 }
 
+// --- source-level pass: tokenize the actual Luau, encrypt string literals
+// and turn integer literals into arithmetic (catph calls these EncryptStrings
+// / NumbersToExpressions). Runs BEFORE the byte-level wrapping below, so the
+// script's own literals are no longer sitting in the output in the clear —
+// previously only the outer loader shell was obfuscated, not the source text
+// the loader carries. Anything we're not fully sure how to rebuild exactly
+// (escaped strings, hex/float numbers) is left untouched rather than risk
+// corrupting the script.
+
+function tokenizeLua(src) {
+  var tokens = [];
+  var i = 0, len = src.length;
+  var isDigit = function (c) { return c >= "0" && c <= "9"; };
+  var isHex = function (c) { return isDigit(c) || (c >= "a" && c <= "f") || (c >= "A" && c <= "F"); };
+  var isNameStart = function (c) { return c === "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z"); };
+  var isNameChar = function (c) { return isNameStart(c) || isDigit(c); };
+
+  function longBracketLevel(at) {
+    // src[at] === '['; returns level (count of '=') if this is a long-bracket
+    // opener, else -1
+    var j = at + 1, eq = 0;
+    while (src[j] === "=") { eq++; j++; }
+    if (src[j] === "[") return eq;
+    return -1;
+  }
+  function readLongBracket(at, level) {
+    // at points at the opening '['; returns end index just past the closer
+    var j = at + 2 + level;
+    if (src[j] === "\n") j++; // Lua skips a leading newline
+    var closer = "]" + new Array(level + 1).join("=") + "]";
+    var close = src.indexOf(closer, j);
+    if (close === -1) return len;
+    return close + closer.length;
+  }
+
+  while (i < len) {
+    var c = src[i];
+
+    if (c === "-" && src[i + 1] === "-") {
+      var start = i;
+      i += 2;
+      if (src[i] === "[") {
+        var lvl = longBracketLevel(i);
+        if (lvl >= 0) { i = readLongBracket(i, lvl); tokens.push({ t: "other", s: start, e: i }); continue; }
+      }
+      while (i < len && src[i] !== "\n") i++;
+      tokens.push({ t: "other", s: start, e: i });
+      continue;
+    }
+
+    if (c === "[" ) {
+      var lvl2 = longBracketLevel(i);
+      if (lvl2 >= 0) {
+        var s2 = i;
+        i = readLongBracket(i, lvl2);
+        tokens.push({ t: "other", s: s2, e: i }); // long strings left alone (rare, risky to rewrite)
+        continue;
+      }
+    }
+
+    if (c === '"' || c === "'") {
+      var quote = c, s3 = i, hasEscape = false;
+      i++;
+      while (i < len && src[i] !== quote) {
+        if (src[i] === "\\") { hasEscape = true; i += 2; continue; }
+        if (src[i] === "\n") break; // unterminated on this line; bail out as plain text
+        i++;
+      }
+      i++; // consume closing quote (or just stop if unterminated)
+      tokens.push({ t: hasEscape ? "other" : "string", s: s3, e: i, inner: [s3 + 1, i - 1] });
+      continue;
+    }
+
+    if (isDigit(c)) {
+      var s4 = i;
+      var isHexNum = c === "0" && (src[i + 1] === "x" || src[i + 1] === "X");
+      if (isHexNum) {
+        i += 2;
+        while (i < len && isHex(src[i])) i++;
+      } else {
+        while (i < len && isDigit(src[i])) i++;
+        if (src[i] === "." ) { i++; while (i < len && isDigit(src[i])) i++; }
+        if (src[i] === "e" || src[i] === "E") {
+          i++;
+          if (src[i] === "+" || src[i] === "-") i++;
+          while (i < len && isDigit(src[i])) i++;
+        }
+      }
+      var text = src.slice(s4, i);
+      var isPlainInt = !isHexNum && /^[0-9]+$/.test(text);
+      tokens.push({ t: isPlainInt ? "number" : "other", s: s4, e: i, val: isPlainInt ? parseInt(text, 10) : null });
+      continue;
+    }
+
+    if (isNameStart(c)) {
+      var s5 = i;
+      i++;
+      while (i < len && isNameChar(src[i])) i++;
+      tokens.push({ t: "other", s: s5, e: i });
+      continue;
+    }
+
+    tokens.push({ t: "other", s: i, e: i + 1 });
+    i++;
+  }
+  return tokens;
+}
+
+function luaStringEncodeCall(decoderName, text) {
+  var key = randInt(1, 255);
+  var parts = [String(key)];
+  for (var i = 0; i < text.length; i++) {
+    parts.push(String((text.charCodeAt(i) + key) % 256));
+  }
+  return decoderName + "({" + parts.join(",") + "})";
+}
+
+// encrypts eligible string literals and turns integer literals into
+// equivalent arithmetic, directly in the Luau source text
+function protectLiterals(src, used) {
+  var tokens = tokenizeLua(src);
+  var decoderName = uglyName(used);
+  var out = [];
+  var last = 0;
+  var touchedString = false;
+
+  for (var k = 0; k < tokens.length; k++) {
+    var tok = tokens[k];
+    if (tok.t === "string") {
+      var text = src.slice(tok.inner[0], tok.inner[1]);
+      // skip empty strings and anything that isn't plain ASCII content —
+      // keeps the rebuild exact without needing a full escape decoder
+      if (text.length > 0 && /^[\x20-\x7e]*$/.test(text)) {
+        out.push(src.slice(last, tok.s));
+        out.push(luaStringEncodeCall(decoderName, text));
+        last = tok.e;
+        touchedString = true;
+      }
+    } else if (tok.t === "number") {
+      out.push(src.slice(last, tok.s));
+      out.push(numExpr(tok.val));
+      last = tok.e;
+    }
+  }
+  out.push(src.slice(last));
+
+  var body = out.join("");
+  if (!touchedString) return body; // no decoder needed if nothing used it
+
+  var decoderDef =
+    "local function " + decoderName + "(t)\n" +
+    "\tlocal k = t[1]\n" +
+    "\tlocal r = {}\n" +
+    "\tfor i = 2, #t do\n" +
+    "\t\tr[i - 1] = string.char((t[i] - k) % 256)\n" +
+    "\tend\n" +
+    "\treturn table.concat(r)\n" +
+    "end\n";
+  return decoderDef + body;
+}
+
 // --- shared: chunk table + decode function ---------------------------------
 
 function buildDataSetup(srcBytes) {
@@ -444,15 +605,22 @@ function renderVM2(srcBytes, report) {
 // mode: "plain" (default) | "cff" | "vm"
 function obfuscate(srcBytes, report, mode) {
   mode = mode || "plain";
+
+  report(0.02, "Encrypting strings and numbers...");
+  var srcText = new TextDecoder().decode(srcBytes);
+  var protectedUsed = new Set();
+  var protectedText = protectLiterals(srcText, protectedUsed);
+  srcBytes = new TextEncoder().encode(protectedText);
+
   if (mode === "vm") {
-    report(0.05, "Encoding layer 1...");
+    report(0.1, "Encoding layer 1...");
     report(0.3, "Encoding layer 2...");
     report(0.55, "Splitting and shuffling chunks...");
     var vmResult = renderVM2(srcBytes, report);
     report(1, "Done");
     return vmResult;
   }
-  report(0.05, "Encoding layer 1...");
+  report(0.1, "Encoding layer 1...");
   report(0.25, "Encoding layer 2...");
   report(0.4, "Encoding layer 3...");
   var setup = buildDataSetup(srcBytes);
