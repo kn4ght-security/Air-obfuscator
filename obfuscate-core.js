@@ -346,9 +346,112 @@ function renderVM(setup) {
   return out;
 }
 
+// --- renderer: VM v2 (two-stage byte encoder + shuffled chunks) ------------
+// Uses Uint8Array bytes throughout so UTF-8 Luau source is preserved. This
+// replaces only the VM mode; plain and CFF retain their existing pipeline.
+function renderVM2(srcBytes, report) {
+  var keyOne = randInt(1, 255), stepOne = randInt(1, 255);
+  var keyTwo = randInt(1, 255), stepTwo = randInt(1, 255);
+  var stageOne = encodeLayer(srcBytes, keyOne, stepOne);
+  var stageTwo = encodeLayer(stageOne, keyTwo, stepTwo);
+
+  var minChunk = 48, maxChunk = 160;
+  var chunks = [], cursor = 0;
+  while (cursor < stageTwo.length) {
+    var size = randInt(minChunk, maxChunk);
+    var end = Math.min(cursor + size, stageTwo.length);
+    chunks.push(stageTwo.slice(cursor, end));
+    cursor = end;
+  }
+
+  var order = shuffledIndices(chunks.length);
+  var physicalSlotOfLogical = new Array(chunks.length);
+  var literals = [];
+  for (var i = 0; i < order.length; i++) {
+    var logical = order[i];
+    physicalSlotOfLogical[logical] = i + 1;
+    literals.push(bytesToLuaString(chunks[logical], 0, chunks[logical].length));
+  }
+
+  var used = new Set();
+  var vChunks = uglyName(used), vOrder = uglyName(used);
+  var vEncoded = uglyName(used), vDecode = uglyName(used);
+  var vInput = uglyName(used), vKey = uglyName(used), vStep = uglyName(used);
+  var vExpected = uglyName(used), vOut = uglyName(used);
+  var vPc = uglyName(used), vIdx = uglyName(used), vByte = uglyName(used);
+  var vDecoded = uglyName(used), vCheck = uglyName(used);
+  var vStageOne = uglyName(used), vSource = uglyName(used);
+  var vLoader = uglyName(used), vErr = uglyName(used);
+  var tag = uglyName(used);
+
+  var orderEntries = [];
+  for (var oi = 0; oi < physicalSlotOfLogical.length; oi++) {
+    orderEntries.push("[" + (oi + 1) + "]=" + physicalSlotOfLogical[oi]);
+  }
+
+  var out = ["-- protected by Air Obfuscator | VM Encode v2"];
+  // Inert noise is kept separate from the decoder and never affects execution.
+  out = out.concat(junkLines(used, randInt(12, 20)));
+  for (var dt = 0, dtn = randInt(1, 3); dt < dtn; dt++) {
+    var tableName = uglyName(used), entries = [];
+    for (var de = 0, den = randInt(3, 8); de < den; de++) {
+      var junk = "";
+      for (var jc = 0, jcn = randInt(8, 24); jc < jcn; jc++) junk += String.fromCharCode(randInt(33, 126));
+      // Keep generated literals valid even when the random text contains quotes.
+      junk = junk.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      entries.push('"' + junk + '"');
+    }
+    out.push("local " + tableName + " = {" + entries.join(",") + "}");
+  }
+
+  out.push("local " + vChunks + " = {" + literals.join(",") + "}");
+  out.push("local " + vOrder + " = {" + orderEntries.join(",") + "}");
+  var assemble = [];
+  for (var ai = 0; ai < physicalSlotOfLogical.length; ai++) {
+    assemble.push(vChunks + "[" + vOrder + "[" + (ai + 1) + "]]");
+  }
+  out.push("local " + vEncoded + " = table.concat({" + assemble.join(",") + "})");
+  out.push("local function " + vDecode + "(" + vInput + "," + vKey + "," + vStep + "," + vExpected + ")");
+  out.push("  local " + vOut + " = {} local " + vCheck + " = 0 local " + vPc + " = 1");
+  out.push("  while " + vPc + " <= #" + vInput + " do");
+  out.push("    local " + vIdx + " = (" + vPc + " + 1) / 2");
+  out.push("    local " + vByte + " = (string.byte(" + vInput + "," + vPc + ") - 33) * 94 + string.byte(" + vInput + "," + vPc + " + 1) - 33");
+  out.push("    local " + vDecoded + " = (" + vByte + " - " + vKey + " - " + vStep + " * " + vIdx + ") % 256");
+  out.push("    " + vCheck + " = (" + vCheck + " + " + vDecoded + " * ((" + vIdx + " % 251) + 1)) % 2147483647");
+  out.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
+  out.push("    " + vPc + " = " + vPc + " + 2");
+  out.push("  end");
+  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[air] " + tag + " payload integrity check failed', 0) end");
+  out.push("  return table.concat(" + vOut + ")");
+  out.push("end");
+
+  // Decoys are syntactically valid but intentionally unrelated to the payload.
+  for (var df = 0, dfn = randInt(2, 3); df < dfn; df++) {
+    var fn = uglyName(used), a = uglyName(used), b = uglyName(used), c = uglyName(used);
+    out.push("local function " + fn + "(" + a + "," + b + ") local " + c + " = {} for _i=1,#" + a + ",3 do " + c + "[#" + c + "+1] = string.byte(" + a + ",_i) end return #" + c + " end");
+  }
+
+  out.push("local " + vStageOne + " = " + vDecode + "(" + vEncoded + "," + keyTwo + "," + stepTwo + "," + checksumOf(stageOne) + ")");
+  out.push("local " + vSource + " = " + vDecode + "(" + vStageOne + "," + keyOne + "," + stepOne + "," + checksumOf(srcBytes) + ")");
+  out.push("if #" + vSource + " ~= " + srcBytes.length + " then error('[air] decoded source length mismatch', 0) end");
+  out.push("local " + vLoader + ", " + vErr + " = (loadstring or load)(" + vSource + ")");
+  out.push("if not " + vLoader + " then error('[air] compile failed: ' .. tostring(" + vErr + "), 0) end");
+  out.push("return " + vLoader + "()");
+  if (report) report(0.9, "Building two-stage VM decoder...");
+  return out.join("\n");
+}
+
 // mode: "plain" (default) | "cff" | "vm"
 function obfuscate(srcBytes, report, mode) {
   mode = mode || "plain";
+  if (mode === "vm") {
+    report(0.05, "Encoding layer 1...");
+    report(0.3, "Encoding layer 2...");
+    report(0.55, "Splitting and shuffling chunks...");
+    var vmResult = renderVM2(srcBytes, report);
+    report(1, "Done");
+    return vmResult;
+  }
   report(0.05, "Encoding layer 1...");
   report(0.25, "Encoding layer 2...");
   report(0.4, "Encoding layer 3...");
