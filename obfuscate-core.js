@@ -262,6 +262,21 @@ function luaStringEncodeCall(decoderName, text) {
   return decoderName + "({" + parts.join(",") + "})";
 }
 
+// true if the nearest non-whitespace character before `pos` could be the
+// end of a prefixexp (a name, `)`, or `]`) — meaning a string literal
+// starting at `pos` might be Lua's no-parens call sugar (`require "x"`,
+// `warn "x"`, `t.f "x"`). Swapping that string for a decoder call turns
+// `f "x"` into `f decode(...)`, two bare statements instead of one call —
+// a compile error. Safe to transform only when NOT preceded by one of these
+// (e.g. after `(`, `,`, `=`, `{`, or at the very start of a statement).
+function precededByCallable(src, pos) {
+  var j = pos - 1;
+  while (j >= 0 && /\s/.test(src[j])) j--;
+  if (j < 0) return false;
+  var c = src[j];
+  return /[A-Za-z0-9_)\]]/.test(c);
+}
+
 // encrypts eligible string literals and turns integer literals into
 // equivalent arithmetic, directly in the Luau source text
 function protectLiterals(src, used) {
@@ -275,9 +290,10 @@ function protectLiterals(src, used) {
     var tok = tokens[k];
     if (tok.t === "string") {
       var text = src.slice(tok.inner[0], tok.inner[1]);
-      // skip empty strings and anything that isn't plain ASCII content —
-      // keeps the rebuild exact without needing a full escape decoder
-      if (text.length > 0 && /^[\x20-\x7e]*$/.test(text)) {
+      // skip empty strings, anything that isn't plain ASCII content (keeps
+      // the rebuild exact without a full escape decoder), and call-sugar
+      // positions (see precededByCallable)
+      if (text.length > 0 && /^[\x20-\x7e]*$/.test(text) && !precededByCallable(src, tok.s)) {
         out.push(src.slice(last, tok.s));
         out.push(luaStringEncodeCall(decoderName, text));
         last = tok.e;
