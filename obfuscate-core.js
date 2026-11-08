@@ -64,15 +64,6 @@ function shuffledIndices(n) {
   return a;
 }
 
-// Fisher-Yates on an arbitrary array, in place, also returned for chaining
-function shuffleArray(arr) {
-  for (var i = arr.length - 1; i > 0; i--) {
-    var j = randInt(0, i);
-    var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-  }
-  return arr;
-}
-
 // a handful of inert decoy locals (random name + random value), never
 // referenced again, just to break up the parts a reader can skim in order
 function junkLines(used, count) {
@@ -103,12 +94,15 @@ function junkLines(used, count) {
   return out;
 }
 
-// render an integer as itself or as a small +,-,* expression that evaluates
-// to the exact same value (never division, to avoid any float drift) — pure
-// cosmetic noise over literals used for keys/steps/checksums/ids
+// render an integer as itself or as an expression that evaluates to the
+// exact same value — cosmetic noise over literals used for keys/steps/
+// checksums/ids, and (via protectLiterals) the user's own number literals.
+// 5 modes, 2 of them (zero-product / mul-div) catph-style anti-dump patterns:
+// a bytecode constant dumper just sees a pile of unrelated-looking integers
+// per obfuscated literal instead of one constant that equals the real value.
 function numExpr(n) {
   if (Math.abs(n) < 4 || Math.random() < 0.3) return String(n);
-  var mode = randInt(0, 2);
+  var mode = randInt(0, n > 0 ? 4 : 3);
   if (mode === 0) {
     var a = randInt(1, Math.min(9999, Math.abs(n) + 500));
     var b = n - a;
@@ -119,10 +113,26 @@ function numExpr(n) {
     var b2 = a2 - n;
     return "(" + a2 + " - " + b2 + ")";
   }
-  var d = randInt(2, 9);
-  var q = Math.trunc(n / d);
-  var rem = n - q * d;
-  return "(" + q + " * " + d + (rem >= 0 ? " + " + rem : " - " + -rem) + ")";
+  if (mode === 2) {
+    var d = randInt(2, 9);
+    var q = Math.trunc(n / d);
+    var rem = n - q * d;
+    return "(" + q + " * " + d + (rem >= 0 ? " + " + rem : " - " + -rem) + ")";
+  }
+  if (mode === 3) {
+    // zero-product shield: (((A ^ B) + C) * 0) + n — A, B, C are random,
+    // A^B+C is a large finite float computed at runtime, * 0 collapses it
+    // to exactly 0 (IEEE-754: finite * 0 = 0), leaving n. A reader has to
+    // evaluate the whole exponent subtree just to confirm it's inert.
+    var A = randInt(100, 0xffff), B = randInt(2, 12), C = randInt(1, 0xffff);
+    return "((((" + A + " ^ " + B + ") + " + C + ") * 0) + " + n + ")";
+  }
+  // mode 4 (n > 0 only): multiply/divide cancellation, n*K / K. K is kept
+  // small enough relative to n that n*K stays well inside the 2^53 exact-
+  // integer range for doubles, so the division has no rounding drift.
+  var kMax = Math.max(2, Math.min(32, Math.floor(0xffffff / (n + 1))));
+  var K = randInt(2, kMax);
+  return "((" + n + " * " + K + ") / " + K + ")";
 }
 
 // symbol set for decoy string junk; backslash/quote excluded since they'd
@@ -133,6 +143,232 @@ function randomDistinctInts(count, min, max) {
   var set = new Set();
   while (set.size < count) set.add(randInt(min, max));
   return Array.from(set);
+}
+
+// --- source-level pass: tokenize the actual Luau, encrypt string literals
+// and turn integer literals into arithmetic (catph calls these EncryptStrings
+// / NumbersToExpressions). Runs BEFORE the byte-level wrapping below, so the
+// script's own literals are no longer sitting in the output in the clear —
+// previously only the outer loader shell was obfuscated, not the source text
+// the loader carries. Anything we're not fully sure how to rebuild exactly
+// (escaped strings, hex/float numbers) is left untouched rather than risk
+// corrupting the script.
+
+function tokenizeLua(src) {
+  var tokens = [];
+  var i = 0, len = src.length;
+  var isDigit = function (c) { return c >= "0" && c <= "9"; };
+  var isHex = function (c) { return isDigit(c) || (c >= "a" && c <= "f") || (c >= "A" && c <= "F"); };
+  var isNameStart = function (c) { return c === "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z"); };
+  var isNameChar = function (c) { return isNameStart(c) || isDigit(c); };
+
+  function longBracketLevel(at) {
+    // src[at] === '['; returns level (count of '=') if this is a long-bracket
+    // opener, else -1
+    var j = at + 1, eq = 0;
+    while (src[j] === "=") { eq++; j++; }
+    if (src[j] === "[") return eq;
+    return -1;
+  }
+  function readLongBracket(at, level) {
+    // at points at the opening '['; returns end index just past the closer
+    var j = at + 2 + level;
+    if (src[j] === "\n") j++; // Lua skips a leading newline
+    var closer = "]" + new Array(level + 1).join("=") + "]";
+    var close = src.indexOf(closer, j);
+    if (close === -1) return len;
+    return close + closer.length;
+  }
+
+  while (i < len) {
+    var c = src[i];
+
+    if (c === "-" && src[i + 1] === "-") {
+      var start = i;
+      i += 2;
+      if (src[i] === "[") {
+        var lvl = longBracketLevel(i);
+        if (lvl >= 0) { i = readLongBracket(i, lvl); tokens.push({ t: "other", s: start, e: i }); continue; }
+      }
+      while (i < len && src[i] !== "\n") i++;
+      tokens.push({ t: "other", s: start, e: i });
+      continue;
+    }
+
+    if (c === "[" ) {
+      var lvl2 = longBracketLevel(i);
+      if (lvl2 >= 0) {
+        var s2 = i;
+        i = readLongBracket(i, lvl2);
+        tokens.push({ t: "other", s: s2, e: i }); // long strings left alone (rare, risky to rewrite)
+        continue;
+      }
+    }
+
+    if (c === '"' || c === "'") {
+      var quote = c, s3 = i, hasEscape = false;
+      i++;
+      while (i < len && src[i] !== quote) {
+        if (src[i] === "\\") { hasEscape = true; i += 2; continue; }
+        if (src[i] === "\n") break; // unterminated on this line; bail out as plain text
+        i++;
+      }
+      i++; // consume closing quote (or just stop if unterminated)
+      tokens.push({ t: hasEscape ? "other" : "string", s: s3, e: i, inner: [s3 + 1, i - 1] });
+      continue;
+    }
+
+    if (isDigit(c)) {
+      var s4 = i;
+      var isHexNum = c === "0" && (src[i + 1] === "x" || src[i + 1] === "X");
+      if (isHexNum) {
+        i += 2;
+        while (i < len && isHex(src[i])) i++;
+      } else {
+        while (i < len && isDigit(src[i])) i++;
+        if (src[i] === "." ) { i++; while (i < len && isDigit(src[i])) i++; }
+        if (src[i] === "e" || src[i] === "E") {
+          i++;
+          if (src[i] === "+" || src[i] === "-") i++;
+          while (i < len && isDigit(src[i])) i++;
+        }
+      }
+      var text = src.slice(s4, i);
+      var isPlainInt = !isHexNum && /^[0-9]+$/.test(text);
+      tokens.push({ t: isPlainInt ? "number" : "other", s: s4, e: i, val: isPlainInt ? parseInt(text, 10) : null });
+      continue;
+    }
+
+    if (isNameStart(c)) {
+      var s5 = i;
+      i++;
+      while (i < len && isNameChar(src[i])) i++;
+      tokens.push({ t: "other", s: s5, e: i });
+      continue;
+    }
+
+    tokens.push({ t: "other", s: i, e: i + 1 });
+    i++;
+  }
+  return tokens;
+}
+
+function luaStringEncodeCall(decoderName, text) {
+  var key = randInt(1, 255);
+  var parts = [String(key)];
+  for (var i = 0; i < text.length; i++) {
+    parts.push(String((text.charCodeAt(i) + key) % 256));
+  }
+  return decoderName + "({" + parts.join(",") + "})";
+}
+
+// true if the nearest non-whitespace character before `pos` could be the
+// end of a prefixexp (a name, `)`, or `]`) — meaning a string literal
+// starting at `pos` might be Lua's no-parens call sugar (`require "x"`,
+// `warn "x"`, `t.f "x"`). Swapping that string for a decoder call turns
+// `f "x"` into `f decode(...)`, two bare statements instead of one call —
+// a compile error. Safe to transform only when NOT preceded by one of these
+// (e.g. after `(`, `,`, `=`, `{`, or at the very start of a statement).
+function precededByCallable(src, pos) {
+  var j = pos - 1;
+  while (j >= 0 && /\s/.test(src[j])) j--;
+  if (j < 0) return false;
+  var c = src[j];
+  return /[A-Za-z0-9_)\]]/.test(c);
+}
+
+// encrypts eligible string literals and turns integer literals into
+// equivalent arithmetic, directly in the Luau source text
+function protectLiterals(src, used) {
+  var tokens = tokenizeLua(src);
+  var decoderName = uglyName(used);
+  var out = [];
+  var last = 0;
+  var touchedString = false;
+
+  for (var k = 0; k < tokens.length; k++) {
+    var tok = tokens[k];
+    if (tok.t === "string") {
+      var text = src.slice(tok.inner[0], tok.inner[1]);
+      // skip empty strings, anything that isn't plain ASCII content (keeps
+      // the rebuild exact without a full escape decoder), and call-sugar
+      // positions (see precededByCallable)
+      if (text.length > 0 && /^[\x20-\x7e]*$/.test(text) && !precededByCallable(src, tok.s)) {
+        out.push(src.slice(last, tok.s));
+        out.push(luaStringEncodeCall(decoderName, text));
+        last = tok.e;
+        touchedString = true;
+      }
+    } else if (tok.t === "number") {
+      out.push(src.slice(last, tok.s));
+      out.push(numExpr(tok.val));
+      last = tok.e;
+    }
+  }
+  out.push(src.slice(last));
+
+  var body = out.join("");
+  if (!touchedString) return body; // no decoder needed if nothing used it
+
+  var decoderDef =
+    "local function " + decoderName + "(t)\n" +
+    "\tlocal k = t[1]\n" +
+    "\tlocal r = {}\n" +
+    "\tfor i = 2, #t do\n" +
+    "\t\tr[i - 1] = string.char((t[i] - k) % 256)\n" +
+    "\tend\n" +
+    "\treturn table.concat(r)\n" +
+    "end\n";
+  return decoderDef + body;
+}
+
+// --- runtime anti-tamper prelude --------------------------------------------
+// A layer on top of the existing checksum guard (which only catches corrupted
+// *bytes*). This verifies the handful of functions the decoder itself leans
+// on — pcall/error/table.unpack — still behave the way Lua defines them,
+// before any decoding happens. If something upstream has patched pcall to
+// swallow errors, or error() to not actually raise, the checksum check could
+// be bypassed entirely; this catches that class of tamper instead.
+// Deliberately NOT included: anything that fingerprints debuggers/hookers
+// (hooked-function scans, getregistry probing, physics-FPS checks, request
+// stack-depth probing) — this only asserts the script's own dependencies are
+// intact, it doesn't try to detect or punish someone inspecting the script.
+
+function buildAntiTamperPrelude(used) {
+  var pcallName = uglyName(used);
+  var errName = uglyName(used);
+  var selName = uglyName(used);
+  var unpackName = uglyName(used);
+  var validName = uglyName(used);
+  var trials = randInt(10, 18);
+
+  return [
+    "local " + pcallName + " = pcall",
+    "local " + errName + " = error",
+    "local " + selName + " = select",
+    "local " + unpackName + " = table.unpack or unpack",
+    "do",
+    "  local " + validName + " = true",
+    "  for _i = 1, " + numExpr(trials) + " do",
+    "    local _shouldErr = (_i % 2 == 0)",
+    "    local _msg = 'air_at_' .. _i",
+    "    local _arr = { " + pcallName + "(function()",
+    "      if _shouldErr then " + errName + "(_msg, 0) end",
+    "      return " + unpackName + "({ _i, _i * 2, _i * 3 })",
+    "    end) }",
+    "    local _n = " + selName + "('#', " + unpackName + "(_arr))",
+    "    if _shouldErr then",
+    "      " + validName + " = " + validName + " and (_arr[1] == false) and (_arr[2] == _msg) and (_n == 2)",
+    "    else",
+    "      " + validName + " = " + validName + " and (_arr[1] == true) and (_arr[2] == _i) and (_arr[3] == _i * 2) and (_arr[4] == _i * 3) and (_n == 4)",
+    "    end",
+    "  end",
+    "  if (0 / 0) == (0 / 0) then " + validName + " = false end",
+    "  if not " + validName + " then",
+    "    " + errName + "('[air] runtime integrity check failed', 0)",
+    "  end",
+    "end",
+  ];
 }
 
 // --- shared: chunk table + decode function ---------------------------------
@@ -180,20 +416,11 @@ function buildDataSetup(srcBytes) {
   var varDecoded = uglyName(used);
   var varCheck = uglyName(used);
 
-  // Chaining chunk[1] .. chunk[2] .. ... .. chunk[n] as one expression broke
-  // on anything but a small script: each ".." is a nested binary expression
-  // to the parser, and Lua/Luau's parser has a nesting-depth limit (roughly
-  // 200). A big script can produce thousands of chunks, so that one
-  // expression blew past the limit and the obfuscated output failed to
-  // load/compile with a parser error (e.g. "chunk has too many syntax
-  // levels"). table.concat({...}) over a flat list has no such limit — it's
-  // the same fix already used by VM v2/VM v2+Anti-Tamper, which never hit
-  // this because they were built with table.concat from the start.
   var reassembleParts = [];
   for (var j = 0; j < n; j++) {
     reassembleParts.push(varChunks + "[" + (physicalSlotOfLogical[j] + 1) + "]");
   }
-  var reassembleExpr = "table.concat({" + reassembleParts.join(",") + "})";
+  var reassembleExpr = reassembleParts.join(" .. ");
 
   var lines = ["-- this file was protected by Air Obfuscator"];
   lines = lines.concat(junkLines(used, randInt(2, 4)));
@@ -230,6 +457,9 @@ function buildDataSetup(srcBytes) {
     { kind: "check" },
     { kind: "call" },
   ];
+
+  var atLines = buildAntiTamperPrelude(used);
+  lines.splice.apply(lines, [1, 0].concat(atLines));
 
   return { lines: lines, used: used, varDecode: varDecode, steps: steps };
 }
@@ -367,24 +597,7 @@ function renderVM(setup) {
 // --- renderer: VM v2 (two-stage byte encoder + shuffled chunks) ------------
 // Uses Uint8Array bytes throughout so UTF-8 Luau source is preserved. This
 // replaces only the VM mode; plain and CFF retain their existing pipeline.
-//
-// antiTamper (mode "vm-at") adds two executor-only defenses on top of the
-// same two-layer decoder:
-//   1. Hook check, before any decoding: a handful of natives the decoder
-//      depends on (loadstring/load, string.byte, string.char, table.concat)
-//      are checked with iscclosure, where the executor provides it. A
-//      genuine native is a C closure; a dumper that has replaced one with a
-//      Lua function to log its arguments is not, so this aborts instead of
-//      handing a hooked function the plaintext. Executors without
-//      iscclosure just skip the check (type(ic) == "function" guards it),
-//      so this never breaks compatibility, it only adds protection where
-//      the executor allows it.
-//   2. Post-run wipe: the previous version returned loader() directly, so
-//      vSource / vStageOne / vChunks stayed alive in the closure for as
-//      long as the script ran, visible to anything that can dump upvalues.
-//      This runs the loaded chunk inside pcall, clears those locals
-//      immediately after, and only then returns/re-raises.
-function renderVM2(srcBytes, report, antiTamper) {
+function renderVM2(srcBytes, report) {
   var keyOne = randInt(1, 255), stepOne = randInt(1, 255);
   var keyTwo = randInt(1, 255), stepTwo = randInt(1, 255);
   var stageOne = encodeLayer(srcBytes, keyOne, stepOne);
@@ -418,57 +631,16 @@ function renderVM2(srcBytes, report, antiTamper) {
   var vStageOne = uglyName(used), vSource = uglyName(used);
   var vLoader = uglyName(used), vErr = uglyName(used);
   var tag = uglyName(used);
-  var vIC = uglyName(used), vNatives = uglyName(used), vNi = uglyName(used), vFn = uglyName(used);
-  var vOk = uglyName(used), vResults = uglyName(used);
 
   var orderEntries = [];
   for (var oi = 0; oi < physicalSlotOfLogical.length; oi++) {
-    orderEntries.push("[" + (oi + 1) + "]=" + numExpr(physicalSlotOfLogical[oi]));
+    orderEntries.push("[" + (oi + 1) + "]=" + physicalSlotOfLogical[oi]);
   }
 
-  // The header and the error text used to spell out "Anti-Tamper" /
-  // "environment integrity check failed" in plain words, so anyone skimming
-  // (or grepping) the output could tell at a glance that a hook check was
-  // present and roughly what it did, even before touching the logic. Neither
-  // mode is named here now, and a failed hook check raises the exact same
-  // message text as a failed decode checksum (built from the same
-  // `payload integrity check failed` template with a fresh random tag), so
-  // the two are indistinguishable from the outside.
   var out = ["-- protected by Air Obfuscator | VM Encode v2"];
+  out = out.concat(buildAntiTamperPrelude(used));
   // Inert noise is kept separate from the decoder and never affects execution.
   out = out.concat(junkLines(used, randInt(12, 20)));
-
-  // Build the hook-check as its own line group (still placed before any
-  // decoding happens, which is the one real constraint), so it can be
-  // spliced into a randomized spot below instead of always sitting right
-  // after the initial junk in the same predictable position every build.
-  var tamperLines = null;
-  if (antiTamper) {
-    var tamperTag = uglyName(used);
-    var allNatives = [
-      "loadstring or load",
-      "string.byte",
-      "string.char",
-      "table.concat",
-      "tostring",
-      "pcall",
-    ];
-    var pickCount = randInt(3, allNatives.length);
-    var picked = shuffleArray(allNatives.slice()).slice(0, pickCount);
-    tamperLines = [];
-    tamperLines.push("do local " + vIC + "=iscclosure if type(" + vIC + ")=='function' then");
-    tamperLines.push("local " + vNatives + "={" + picked.join(",") + "}");
-    tamperLines.push("for " + vNi + "=1,#" + vNatives + " do local " + vFn + "=" + vNatives + "[" + vNi + "]");
-    tamperLines.push("if type(" + vFn + ")=='function' and not " + vIC + "(" + vFn + ") then error('[air] " + tamperTag + " payload integrity check failed',0) end");
-    tamperLines.push("end end end");
-  }
-
-  // Everything from here up to (not including) the first real decode call is
-  // collected as named segments rather than pushed straight to `out`, so the
-  // hook check (if any) can be spliced into a randomized gap between them —
-  // it only has to run before that first decode call, not always
-  // immediately after the opening junk.
-  var segTableDecoys = [];
   for (var dt = 0, dtn = randInt(1, 3); dt < dtn; dt++) {
     var tableName = uglyName(used), entries = [];
     for (var de = 0, den = randInt(3, 8); de < den; de++) {
@@ -478,89 +650,65 @@ function renderVM2(srcBytes, report, antiTamper) {
       junk = junk.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
       entries.push('"' + junk + '"');
     }
-    segTableDecoys.push("local " + tableName + " = {" + entries.join(",") + "}");
+    out.push("local " + tableName + " = {" + entries.join(",") + "}");
   }
 
-  var segChunkSetup = [];
-  segChunkSetup.push("local " + vChunks + " = {" + literals.join(",") + "}");
-  segChunkSetup.push("local " + vOrder + " = {" + orderEntries.join(",") + "}");
+  out.push("local " + vChunks + " = {" + literals.join(",") + "}");
+  out.push("local " + vOrder + " = {" + orderEntries.join(",") + "}");
   var assemble = [];
   for (var ai = 0; ai < physicalSlotOfLogical.length; ai++) {
     assemble.push(vChunks + "[" + vOrder + "[" + (ai + 1) + "]]");
   }
-  segChunkSetup.push("local " + vEncoded + " = table.concat({" + assemble.join(",") + "})");
-
-  // Every fixed constant the decoder relies on (base-94 packing, the
-  // checksum modulus, the byte range) is run through numExpr too, same as
-  // the keys/steps/checksums below — it's arithmetic the VM already does at
-  // runtime, so replacing a literal with an equivalent +/-/* expression
-  // costs nothing and makes the constants harder to spot by eye.
-  var segDecodeFn = [];
-  segDecodeFn.push("local function " + vDecode + "(" + vInput + "," + vKey + "," + vStep + "," + vExpected + ")");
-  segDecodeFn.push("  local " + vOut + " = {} local " + vCheck + " = 0 local " + vPc + " = " + numExpr(1));
-  segDecodeFn.push("  while " + vPc + " <= #" + vInput + " do");
-  segDecodeFn.push("    local " + vIdx + " = (" + vPc + " + " + numExpr(1) + ") / 2");
-  segDecodeFn.push("    local " + vByte + " = (string.byte(" + vInput + "," + vPc + ") - " + numExpr(33) + ") * " + numExpr(94) + " + string.byte(" + vInput + "," + vPc + " + 1) - " + numExpr(33));
-  segDecodeFn.push("    local " + vDecoded + " = (" + vByte + " - " + vKey + " - " + vStep + " * " + vIdx + ") % " + numExpr(256));
-  segDecodeFn.push("    " + vCheck + " = (" + vCheck + " + " + vDecoded + " * ((" + vIdx + " % " + numExpr(251) + ") + 1)) % " + numExpr(2147483647));
-  segDecodeFn.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
-  segDecodeFn.push("    " + vPc + " = " + vPc + " + " + numExpr(2));
-  segDecodeFn.push("  end");
-  segDecodeFn.push("  if " + vCheck + " ~= " + vExpected + " then error('[air] " + tag + " payload integrity check failed', 0) end");
-  segDecodeFn.push("  return table.concat(" + vOut + ")");
-  segDecodeFn.push("end");
+  out.push("local " + vEncoded + " = table.concat({" + assemble.join(",") + "})");
+  out.push("local function " + vDecode + "(" + vInput + "," + vKey + "," + vStep + "," + vExpected + ")");
+  out.push("  local " + vOut + " = {} local " + vCheck + " = 0 local " + vPc + " = 1");
+  out.push("  while " + vPc + " <= #" + vInput + " do");
+  out.push("    local " + vIdx + " = (" + vPc + " + 1) / 2");
+  out.push("    local " + vByte + " = (string.byte(" + vInput + "," + vPc + ") - 33) * 94 + string.byte(" + vInput + "," + vPc + " + 1) - 33");
+  out.push("    local " + vDecoded + " = (" + vByte + " - " + vKey + " - " + vStep + " * " + vIdx + ") % 256");
+  out.push("    " + vCheck + " = (" + vCheck + " + " + vDecoded + " * ((" + vIdx + " % 251) + 1)) % 2147483647");
+  out.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
+  out.push("    " + vPc + " = " + vPc + " + 2");
+  out.push("  end");
+  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[air] " + tag + " payload integrity check failed', 0) end");
+  out.push("  return table.concat(" + vOut + ")");
+  out.push("end");
 
   // Decoys are syntactically valid but intentionally unrelated to the payload.
-  var segDecoyFns = [];
   for (var df = 0, dfn = randInt(2, 3); df < dfn; df++) {
     var fn = uglyName(used), a = uglyName(used), b = uglyName(used), c = uglyName(used);
-    segDecoyFns.push("local function " + fn + "(" + a + "," + b + ") local " + c + " = {} for _i=1,#" + a + ",3 do " + c + "[#" + c + "+1] = string.byte(" + a + ",_i) end return #" + c + " end");
+    out.push("local function " + fn + "(" + a + "," + b + ") local " + c + " = {} for _i=1,#" + a + ",3 do " + c + "[#" + c + "+1] = string.byte(" + a + ",_i) end return #" + c + " end");
   }
 
-  var segments = [segTableDecoys, segChunkSetup, segDecodeFn, segDecoyFns];
-  if (tamperLines) {
-    segments.splice(randInt(0, segments.length), 0, tamperLines);
-  }
-  for (var sg = 0; sg < segments.length; sg++) {
-    out = out.concat(segments[sg]);
-  }
-
-  out.push("local " + vStageOne + " = " + vDecode + "(" + vEncoded + "," + numExpr(keyTwo) + "," + numExpr(stepTwo) + "," + numExpr(checksumOf(stageOne)) + ")");
-  out.push("local " + vSource + " = " + vDecode + "(" + vStageOne + "," + numExpr(keyOne) + "," + numExpr(stepOne) + "," + numExpr(checksumOf(srcBytes)) + ")");
-  out.push("if #" + vSource + " ~= " + numExpr(srcBytes.length) + " then error('[air] decoded source length mismatch', 0) end");
+  out.push("local " + vStageOne + " = " + vDecode + "(" + vEncoded + "," + keyTwo + "," + stepTwo + "," + checksumOf(stageOne) + ")");
+  out.push("local " + vSource + " = " + vDecode + "(" + vStageOne + "," + keyOne + "," + stepOne + "," + checksumOf(srcBytes) + ")");
+  out.push("if #" + vSource + " ~= " + srcBytes.length + " then error('[air] decoded source length mismatch', 0) end");
   out.push("local " + vLoader + ", " + vErr + " = (loadstring or load)(" + vSource + ")");
   out.push("if not " + vLoader + " then error('[air] compile failed: ' .. tostring(" + vErr + "), 0) end");
-
-  if (antiTamper) {
-    // Drop the plaintext references before the loaded chunk runs, not after:
-    // once vLoader is compiled it holds its own copy, so the originals are
-    // no longer needed and don't need to survive the call.
-    out.push(vChunks + ", " + vOrder + ", " + vEncoded + ", " + vStageOne + ", " + vSource + " = nil, nil, nil, nil, nil");
-    out.push("local " + vResults + " = table.pack(pcall(" + vLoader + "))");
-    out.push(vLoader + " = nil");
-    out.push("local " + vOk + " = " + vResults + "[1]");
-    out.push("if not " + vOk + " then error(" + vResults + "[2], 0) end");
-    out.push("return table.unpack(" + vResults + ", 2, " + vResults + ".n)");
-  } else {
-    out.push("return " + vLoader + "()");
-  }
-
+  out.push("return " + vLoader + "()");
   if (report) report(0.9, "Building two-stage VM decoder...");
   return out.join("\n");
 }
 
-// mode: "plain" (default) | "cff" | "vm" | "vm-at"
+// mode: "plain" (default) | "cff" | "vm"
 function obfuscate(srcBytes, report, mode) {
   mode = mode || "plain";
-  if (mode === "vm" || mode === "vm-at") {
-    report(0.05, "Encoding layer 1...");
+
+  report(0.02, "Encrypting strings and numbers...");
+  var srcText = new TextDecoder().decode(srcBytes);
+  var protectedUsed = new Set();
+  var protectedText = protectLiterals(srcText, protectedUsed);
+  srcBytes = new TextEncoder().encode(protectedText);
+
+  if (mode === "vm") {
+    report(0.1, "Encoding layer 1...");
     report(0.3, "Encoding layer 2...");
     report(0.55, "Splitting and shuffling chunks...");
-    var vmResult = renderVM2(srcBytes, report, mode === "vm-at");
+    var vmResult = renderVM2(srcBytes, report);
     report(1, "Done");
     return vmResult;
   }
-  report(0.05, "Encoding layer 1...");
+  report(0.1, "Encoding layer 1...");
   report(0.25, "Encoding layer 2...");
   report(0.4, "Encoding layer 3...");
   var setup = buildDataSetup(srcBytes);
