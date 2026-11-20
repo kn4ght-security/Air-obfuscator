@@ -423,8 +423,8 @@ function buildAntiTamperPrelude(used) {
     return decName + "({" + parts.join(",") + "})";
   }
 
-  var probeTag = hidden("air_at_");
-  var failMsg = hidden("[air] runtime integrity check failed");
+  var probeTag = hidden("ar_at_");
+  var failMsg = hidden("[ar] runtime integrity check failed");
 
   // group 1: the decoder for this block's own strings, plus the two
   // functions under test aliased to local names (so a global patch made
@@ -445,12 +445,33 @@ function buildAntiTamperPrelude(used) {
 
   // group 2: string/table primitives the decoder itself calls on every
   // byte — if these are hooked to lie, bytes decode wrong without ever
-  // tripping the pcall/error check above
+  // tripping the pcall/error check above.
+  // Also: anti-hook check — verify that string.byte, string.char, and
+  // tostring have not been replaced by executor closures (hookfunction
+  // leaves isexecutorclosure() true on the replacement; we detect that
+  // without naming the executor API, so the check degrades gracefully
+  // on vanilla Lua where isexecutorclosure is absent).
+  var hookCheckName  = uglyName(used);
+  var isExecName     = uglyName(used);
   var depCheck = [
+    // primitive integrity (original check)
     "  " + validName + " = " + validName +
       " and (string.char(65) == string.char(65))" +
       " and (string.byte(string.char(66)) == 66)" +
       " and (table.concat({string.char(67), string.char(68)}) == (string.char(67) .. string.char(68)))",
+    // anti-hook: resolve isexecutorclosure / iscclosure once at top of block
+    "  local " + isExecName + " = (type(isexecutorclosure) == 'function' and isexecutorclosure)" +
+      " or (type(iscclosure) == 'function' and function(f) return not iscclosure(f) end)" +
+      " or nil",
+    // probe the three primitives we depend on; if any is now an executor
+    // closure it has been hooked — flag invalid
+    "  local " + hookCheckName + " = true",
+    "  for _, _hf in ipairs({ string.byte, string.char, tostring }) do",
+    "    if " + isExecName + " and " + isExecName + "(_hf) then",
+    "      " + hookCheckName + " = false break",
+    "    end",
+    "  end",
+    "  " + validName + " = " + validName + " and " + hookCheckName,
   ];
 
   // group 3: pcall/error/select/table.unpack still mean what Lua says
@@ -569,8 +590,8 @@ function buildDataSetup(srcBytes) {
     "    " + varPc + " = " + varPc + " + 2",
     "  end",
     "  if " + varCheck + " ~= " + varExpected + " then",
-    "    print('[air] payload checksum mismatch; data may be corrupted or modified')",
-    "    error('[air] integrity check failed', 0)",
+    "    print('[ar] payload checksum mismatch; data may be corrupted or modified')",
+    "    error('[ar] integrity check failed', 0)",
     "  end",
     "  return table.concat(" + varOut + ")",
     "end"
@@ -611,7 +632,7 @@ function renderPlain(setup) {
   out.push("local " + varStageOne + " = " + varDecode + "(" + varStageTwo + "," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + ")");
   out.push("local " + varSource + " = " + varDecode + "(" + varStageOne + "," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + ")");
   out.push("local " + varLoader + ", " + varErr + " = (loadstring or load)(" + varSource + ")");
-  out.push("if not " + varLoader + " then error('[air] compile failed: ' .. tostring(" + varErr + "), 0) end");
+  out.push("if not " + varLoader + " then error('[ar] compile failed: ' .. tostring(" + varErr + "), 0) end");
   out.push(varLoader + "()");
   return out;
 }
@@ -641,7 +662,7 @@ function renderCFF(setup) {
     "    " + varStageOne + " = " + varDecode + "(" + varStageTwo + "," + numExpr(s1.key) + "," + numExpr(s1.step) + "," + numExpr(s1.expected) + ")",
     "    " + varSource + " = " + varDecode + "(" + varStageOne + "," + numExpr(s2.key) + "," + numExpr(s2.step) + "," + numExpr(s2.expected) + ")",
     "    " + varLoader + ", " + varErr + " = (loadstring or load)(" + varSource + ")",
-    "    if not " + varLoader + " then error('[air] compile failed: ' .. tostring(" + varErr + "), 0) end",
+    "    if not " + varLoader + " then error('[ar] compile failed: ' .. tostring(" + varErr + "), 0) end",
     "    " + varLoader + "()",
   ];
 
@@ -712,11 +733,11 @@ function renderVM(setup) {
   out.push("  elseif " + varOp + " == " + numExpr(OP_LOAD) + " then");
   out.push("    " + varR + "[" + varIns + ".a], " + varR + "[" + varIns + ".b] = (loadstring or load)(" + varR + "[" + varIns + ".c])");
   out.push("  elseif " + varOp + " == " + numExpr(OP_CHECK) + " then");
-  out.push("    if not " + varR + "[" + varIns + ".a] then error('[air] compile failed (' .. tostring(" + varISA + "[" + varOp + "]) .. '): ' .. tostring(" + varR + "[" + varIns + ".b]), 0) end");
+  out.push("    if not " + varR + "[" + varIns + ".a] then error('[ar] compile failed (' .. tostring(" + varISA + "[" + varOp + "]) .. '): ' .. tostring(" + varR + "[" + varIns + ".b]), 0) end");
   out.push("  elseif " + varOp + " == " + numExpr(OP_CALL) + " then");
   out.push("    " + varR + "[" + varIns + ".a]()");
   out.push("  else");
-  out.push("    error('[air] unimplemented opcode ' .. tostring(" + varOp + "))");
+  out.push("    error('[ar] unimplemented opcode ' .. tostring(" + varOp + "))");
   out.push("  end");
   out.push("  " + varPc + " = " + varPc + " + 1");
   out.push("end");
@@ -800,7 +821,7 @@ function renderVM2(srcBytes, report) {
   out.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
   out.push("    " + vPc + " = " + vPc + " + 2");
   out.push("  end");
-  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[air] " + tag + " payload integrity check failed', 0) end");
+  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[ar] " + tag + " payload integrity check failed', 0) end");
   out.push("  return table.concat(" + vOut + ")");
   out.push("end");
 
@@ -812,9 +833,9 @@ function renderVM2(srcBytes, report) {
 
   out.push("local " + vStageOne + " = " + vDecode + "(" + vEncoded + "," + keyTwo + "," + stepTwo + "," + checksumOf(stageOne) + ")");
   out.push("local " + vSource + " = " + vDecode + "(" + vStageOne + "," + keyOne + "," + stepOne + "," + checksumOf(srcBytes) + ")");
-  out.push("if #" + vSource + " ~= " + srcBytes.length + " then error('[air] decoded source length mismatch', 0) end");
+  out.push("if #" + vSource + " ~= " + srcBytes.length + " then error('[ar] decoded source length mismatch', 0) end");
   out.push("local " + vLoader + ", " + vErr + " = (loadstring or load)(" + vSource + ")");
-  out.push("if not " + vLoader + " then error('[air] compile failed: ' .. tostring(" + vErr + "), 0) end");
+  out.push("if not " + vLoader + " then error('[ar] compile failed: ' .. tostring(" + vErr + "), 0) end");
   out.push("return " + vLoader + "()");
   if (report) report(0.9, "Building two-stage VM decoder...");
   return out.join("\n");
@@ -896,7 +917,7 @@ function renderComplex(srcBytes, report) {
   out.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
   out.push("    " + vPc + " = " + vPc + " + 2");
   out.push("  end");
-  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[air] " + tag + " payload integrity check failed', 0) end");
+  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[ar] " + tag + " payload integrity check failed', 0) end");
   out.push("  return table.concat(" + vOut + ")");
   out.push("end");
 
@@ -922,9 +943,9 @@ function renderComplex(srcBytes, report) {
   }
   var sourceVar = stageVarNames[LAYERS - 1];
 
-  var lengthCheckBody = "    if #" + sourceVar + " ~= " + numExpr(srcBytes.length) + " then error('[air] decoded source length mismatch', 0) end";
+  var lengthCheckBody = "    if #" + sourceVar + " ~= " + numExpr(srcBytes.length) + " then error('[ar] decoded source length mismatch', 0) end";
   var loadBody = "    " + vLoader + ", " + vErr + " = (loadstring or load)(" + sourceVar + ")";
-  var checkBody = "    if not " + vLoader + " then error('[air] compile failed: ' .. tostring(" + vErr + "), 0) end";
+  var checkBody = "    if not " + vLoader + " then error('[ar] compile failed: ' .. tostring(" + vErr + "), 0) end";
   var callBody = "    return " + vLoader + "()"; // terminal step: no state-advance line after this (see below)
 
   var bodies = [reassembleStmt].concat(decodeBodies).concat([lengthCheckBody, loadBody, checkBody, callBody]);
