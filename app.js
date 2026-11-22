@@ -119,18 +119,19 @@
       }
       function scanMacros(src) {
         var ALL = [
-          { key: "AR_OBFUSCATED",      label: "AR_OBFUSCATED",      desc: "Compile-time true flag" },
-          { key: "AR_LINE",            label: "AR_LINE",             desc: "Inlined line number" },
-          { key: "AR_ENCSTR",          label: "AR_ENCSTR(…)",        desc: "String pool encryption" },
-          { key: "AR_ENCNUM",          label: "AR_ENCNUM(…)",        desc: "Number encoding" },
-          { key: "AR_OPAQUE",          label: "AR_OPAQUE(…)",        desc: "Opaque predicate" },
-          { key: "AR_CRASH",           label: "AR_CRASH()",          desc: "Hard crash injection" },
+          { key: "AR_OBFUSCATED",      label: "AR_OBFUSCATED",       desc: "Compile-time true flag" },
+          { key: "AR_LINE",            label: "AR_LINE",              desc: "Inlined line number" },
+          { key: "AR_ENCSTR",          label: "AR_ENCSTR(…)",         desc: "String pool encryption" },
+          { key: "AR_ENCNUM",          label: "AR_ENCNUM(…)",         desc: "Number encoding" },
+          { key: "AR_OPAQUE",          label: "AR_OPAQUE(…)",         desc: "Opaque predicate" },
+          { key: "AR_CRASH",           label: "AR_CRASH()",           desc: "Hard crash injection" },
           { key: "AR_ANTIHOOK_SILENT", label: "AR_ANTIHOOK_SILENT()", desc: "Silent hook check" },
-          { key: "AR_ANTIHOOK",        label: "AR_ANTIHOOK()",       desc: "Anti-hook guard" },
-          { key: "AR_NO_VIRTUALIZE",   label: "AR_NO_VIRTUALIZE()",  desc: "Skip VM on function" },
-          { key: "AR_VIRTUALIZE",      label: "AR_VIRTUALIZE()",     desc: "Force VM on function" },
-          { key: "AR_JIT_MAX",         label: "AR_JIT_MAX()",        desc: "Max JIT tier" },
-          { key: "AR_VM_MAX",          label: "AR_VM_MAX()",         desc: "Max VM protection" },
+          { key: "AR_ANTIHOOK",        label: "AR_ANTIHOOK()",        desc: "Anti-hook guard" },
+          { key: "AR_ANTIDUMP",        label: "AR_ANTIDUMP()",        desc: "Anti-dump string scrambler" },
+          { key: "AR_NO_VIRTUALIZE",   label: "AR_NO_VIRTUALIZE()",   desc: "Skip VM on function" },
+          { key: "AR_VIRTUALIZE",      label: "AR_VIRTUALIZE()",      desc: "Force VM on function" },
+          { key: "AR_JIT_MAX",         label: "AR_JIT_MAX()",         desc: "Max JIT tier" },
+          { key: "AR_VM_MAX",          label: "AR_VM_MAX()",          desc: "Max VM protection" },
         ];
         var found = [];
         var text = src instanceof Uint8Array
