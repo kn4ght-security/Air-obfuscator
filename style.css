@@ -168,3 +168,51 @@ footer a:hover { color: var(--text); }
 .back { display: inline-block; margin-top: 10px; font-size: 14px; }
 
 @media (prefers-reduced-motion: reduce) { #snow { display: none; } }
+
+/* ── AR_ macro pins ─────────────────────────────── */
+#macroPins {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  background: rgba(156,125,255,0.07);
+  border: 1px solid rgba(156,125,255,0.22);
+  border-radius: 10px;
+}
+.macro-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--sub);
+  margin: 0 0 10px;
+}
+.macro-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.macro-pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(156,125,255,0.13);
+  border: 1px solid rgba(156,125,255,0.35);
+  border-radius: 20px;
+  padding: 3px 11px;
+  font-size: 12px;
+  font-family: "Fira Code", "Cascadia Code", monospace;
+  color: #c4b0ff;
+  cursor: default;
+  transition: background .15s, border-color .15s;
+}
+.macro-pin::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9c7dff;
+  flex-shrink: 0;
+}
+.macro-pin:hover {
+  background: rgba(156,125,255,0.22);
+  border-color: rgba(156,125,255,0.6);
+}
