@@ -297,3 +297,155 @@ function MacroPass.apply(src, options)
 end
 
 return MacroPass
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  BUFF PACK — additional macros for Air Obfuscator
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ── AR_FAKEENV() ────────────────────────────────────────────────────────────
+-- Emits a do...end block that shadows the common Roblox globals most
+-- executor hooks inspect (game, workspace, Players, script, require, getfenv,
+-- setfenv) with dead proxy tables.  Every field-access or call on those
+-- proxies errors immediately.  The user's real upvalue captures happen
+-- BEFORE this block, so the actual script is unaffected.
+--
+-- Usage:  AR_FAKEENV()   — place near the top of the file
+--
+local FAKEENV_TARGETS = {
+    "game", "workspace", "Players", "script",
+    "require", "getfenv", "setfenv",
+}
+
+local function fakeenv_block()
+    local lines = {
+        "do",
+        "  -- AR_FAKEENV: shadow globals to confuse env-scanners",
+        "  local _fe_mt = {",
+        "    __index    = function() error('', 0) end,",
+        "    __call     = function() error('', 0) end,",
+        "    __newindex = function() error('', 0) end,",
+        "  }",
+        "  local function _fe_proxy() local t = {} setmetatable(t, _fe_mt) return t end",
+    }
+    for _, name in ipairs(FAKEENV_TARGETS) do
+        lines[#lines + 1] = "  local " .. name .. " = _fe_proxy() --luau: shadow"
+    end
+    lines[#lines + 1] = "end"
+    return table.concat(lines, "\n")
+end
+
+-- ── AR_DEADFUNC(n) ──────────────────────────────────────────────────────────
+-- Emits n syntactically correct but semantically dead Luau functions.
+-- Each function does plausible-looking string/table busywork so a simple
+-- "strip unreferenced locals" pass won't trivially DCE them.
+--
+-- Usage:  AR_DEADFUNC()     — 1 function
+--         AR_DEADFUNC(3)    — 3 functions
+--         AR_DEADFUNC(5)    — 5 functions (max clamped at 8)
+--
+local DEADFUNC_SHAPES = {
+    -- shape A: byte-sum → char concat
+    function(a, b, c, d)
+        return table.concat({
+            "  local " .. c .. " = 0",
+            "  for " .. d .. " = 1, #" .. a .. " do",
+            "    " .. c .. " = " .. c .. " + string.byte(" .. a .. ", " .. d .. ")",
+            "  end",
+            "  return string.char(" .. c .. " % 256) .. " .. b,
+        }, "\n")
+    end,
+    -- shape B: rep / sub pattern
+    function(a, b, c, _d)
+        return table.concat({
+            "  local " .. c .. " = string.rep(" .. a .. ", math.max(1, math.floor(#" .. b .. " / 3)))",
+            "  return string.sub(" .. c .. ", 1, #" .. a .. ")",
+        }, "\n")
+    end,
+    -- shape C: table accumulate
+    function(a, b, c, d)
+        return table.concat({
+            "  local " .. c .. " = {}",
+            "  for " .. d .. " = 1, #" .. a .. " do",
+            "    " .. c .. "[" .. d .. "] = string.byte(" .. a .. ", " .. d .. ")",
+            "  end",
+            "  return table.concat(" .. c .. ") .. " .. b,
+        }, "\n")
+    end,
+}
+
+local _df_counter = 0
+local function deadfunc_block(count)
+    count = math.min(math.max(math.floor(count or 1), 1), 8)
+    local out = {}
+    for i = 1, count do
+        _df_counter = _df_counter + 1
+        local fname = "_df_" .. _df_counter
+        local a = "_dfa" .. _df_counter
+        local b = "_dfb" .. _df_counter
+        local c = "_dfc" .. _df_counter
+        local d = "_dfd" .. _df_counter
+        local shape = DEADFUNC_SHAPES[((i - 1) % #DEADFUNC_SHAPES) + 1]
+        out[#out + 1] = table.concat({
+            "local function " .. fname .. "(" .. a .. ", " .. b .. ")",
+            shape(a, b, c, d),
+            "end",
+        }, "\n")
+    end
+    return table.concat(out, "\n")
+end
+
+-- ── AR_STRBLEND("text") ─────────────────────────────────────────────────────
+-- Splits a string literal into 2–4 pieces and emits them as a concat chain
+-- so the constant pool never carries the original string whole.  Only plain
+-- printable-ASCII strings are split; anything else is returned verbatim.
+--
+-- Usage:  AR_STRBLEND("hello world")  →  "hello" .. " wor" .. "ld"
+--
+local function strblend_expr(s)
+    if #s <= 3 then return '"' .. s .. '"' end
+    local pieces = {}
+    local len = #s
+    local cursor = 1
+    local slices = math.min(4, math.max(2, math.floor(len / 4)))
+    for i = 1, slices - 1 do
+        local remaining = len - cursor + 1
+        local take = math.max(1, math.floor(remaining * 2 / (slices - i + 1)))
+        take = math.min(take, remaining - (slices - i))
+        pieces[#pieces + 1] = '"' .. s:sub(cursor, cursor + take - 1) .. '"'
+        cursor = cursor + take
+    end
+    pieces[#pieces + 1] = '"' .. s:sub(cursor) .. '"'
+    return table.concat(pieces, " .. ")
+end
+
+-- ── Patch MacroPass.apply to handle the three new macros ───────────────────
+local _orig_apply = MacroPass.apply
+
+function MacroPass.apply(src, options)
+    -- run the original pass first (handles AR_ANTIHOOK, AR_ANTIDUMP, etc.)
+    src = _orig_apply(src, options)
+
+    -- 11b. AR_FAKEENV() → proxy-shadow block
+    src = src:gsub("AR_FAKEENV%s*%(%s*%)", function()
+        return fakeenv_block()
+    end)
+
+    -- 11c. AR_DEADFUNC(n) or AR_DEADFUNC()
+    src = src:gsub("AR_DEADFUNC%s*%(%s*(%d*)%s*%)", function(n)
+        return deadfunc_block(tonumber(n) or 1)
+    end)
+
+    -- 11d. AR_STRBLEND("...") / AR_STRBLEND('...')
+    --      Only handles plain printable ASCII bodies (same safety policy as
+    --      protectLiterals in the JS side: exact rebuild guaranteed).
+    src = src:gsub('AR_STRBLEND%s*%(%s*(["\'])(.-)%1%s*%)', function(_, body)
+        if body:match("^[%x20-%x7e]*$") then
+            return strblend_expr(body)
+        end
+        return '"' .. body .. '"'   -- fallback: leave as plain string
+    end)
+
+    return src
+end
+
+return MacroPass

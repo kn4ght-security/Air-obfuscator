@@ -1022,3 +1022,286 @@ function obfuscate(srcBytes, report, mode) {
 }
 
 self.ObfuscateCore = { obfuscate: obfuscate };
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AIR OBFUSCATOR — BUFF PACK
+//  Extra encode modes, stronger numExpr paths, and new helper generators.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── numExpr extension: two additional modes ────────────────────────────────
+// Monkey-patch numExpr so the extra modes fold in naturally everywhere it
+// is already called (junkLines, buildDataSetup, renderCFF, renderComplex …)
+(function () {
+  var _orig = numExpr;
+  numExpr = function numExprX(n) {
+    // 25 % chance of using one of the two new modes for positive integers
+    if (n > 0 && Math.random() < 0.25) {
+      var pick = randInt(0, 1);
+
+      if (pick === 0) {
+        // ── Nested table lookup ───────────────────────────────────────────
+        // Build a tiny one-shot table { [slot] = value } and read it back.
+        // The dump / static analyser sees two unrelated integers; only the
+        // interpreter can recover the real value by doing the lookup at run
+        // time.  Example output:  ({[7]=42})[7]
+        var slot = randInt(1, 31);
+        return "({[" + slot + "]=" + n + "})[" + slot + "]";
+      } else {
+        // ── bit32.bxor double-XOR ─────────────────────────────────────────
+        // Pick a random mask M; emit  bit32.bxor(bit32.bxor(n, M), M)
+        // which always equals n, but forces the constant table to carry M
+        // as well.  Roblox's Luau environment always has bit32 available.
+        var mask = randInt(1, 0xffff);
+        return "bit32.bxor(bit32.bxor(" + n + "," + mask + ")," + mask + ")";
+      }
+    }
+    return _orig(n);
+  };
+})();
+
+// ── Decoy function generator ───────────────────────────────────────────────
+// Emits `count` syntactically valid but semantically dead Luau functions.
+// Each does plausible-looking string/table work so it won't be trivially
+// DCE'd by a deobfuscator heuristic that strips locals never called.
+// The names are added to `used` so they don't collide with real names.
+function decoyFunctions(used, count) {
+  var ops = ["string.byte", "string.char", "table.concat", "string.rep", "string.len", "string.sub"];
+  var out = [];
+  for (var i = 0; i < count; i++) {
+    var fname = uglyName(used);
+    var a = uglyName(used), b = uglyName(used), c = uglyName(used), d = uglyName(used);
+    var op = ops[randInt(0, ops.length - 1)];
+    // Three different body shapes so they don't all look the same
+    var shape = randInt(0, 2);
+    var body;
+    if (shape === 0) {
+      body =
+        "  local " + c + " = {}\n" +
+        "  for " + d + " = 1, #" + a + " do\n" +
+        "    " + c + "[" + d + "] = string.byte(" + a + ", " + d + ")\n" +
+        "  end\n" +
+        "  return table.concat(" + c + ", " + numExpr(randInt(1, 9)) + " == " + numExpr(randInt(1, 9)) + " and " + b + " or \"\")\n";
+    } else if (shape === 1) {
+      body =
+        "  local " + c + " = string.rep(" + a + ", math.max(1, math.floor(#" + b + " / " + numExpr(randInt(2, 8)) + ")))\n" +
+        "  return string.sub(" + c + ", 1, #" + a + ")\n";
+    } else {
+      body =
+        "  local " + c + " = 0\n" +
+        "  for " + d + " = 1, #" + a + " do " + c + " = " + c + " + string.byte(" + a + ", " + d + ") end\n" +
+        "  return string.char(" + c + " % 256) .. " + b + "\n";
+    }
+    out.push("local function " + fname + "(" + a + ", " + b + ")\n" + body + "end");
+  }
+  return out;
+}
+
+// ── Fake-env poison block ──────────────────────────────────────────────────
+// Emits a do...end block that creates shadowing locals whose names look like
+// the real Roblox globals an attacker would hook (game, workspace, Players,
+// script, require) but whose values are dead tables that immediately error
+// if accessed via field-access or call.  The real globals are captured in
+// upvalues *before* this block fires, so the user's script is unaffected.
+// Place AR_FAKEENV() near the very top of your script.
+function fakeEnvBlock(used) {
+  var TARGETS = ["game", "workspace", "Players", "script", "require", "getfenv", "setfenv"];
+  var proxy = uglyName(used);
+  var mt    = uglyName(used);
+  var lines = [
+    "do",
+    "  -- AR_FAKEENV: shadow globals to confuse env-scanners",
+    "  local " + mt + " = { __index = function() error('', 0) end, __call = function() error('', 0) end, __newindex = function() error('', 0) end }",
+    "  local function " + proxy + "() local t = {} setmetatable(t, " + mt + ") return t end",
+  ];
+  for (var i = 0; i < TARGETS.length; i++) {
+    lines.push("  local " + TARGETS[i] + " = " + proxy + "() --luau: shadow");
+  }
+  lines.push("end");
+  return lines.join("\n");
+}
+
+// ── String-blend helper ────────────────────────────────────────────────────
+// Split a string into 2–4 random-length pieces and emit them as a concat
+// chain so the constant pool never contains the original string whole.
+// Used by the AR_STRBLEND macro expansion (see macro-pass patch below).
+function strBlend(s, used) {
+  if (s.length <= 3) return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+  var parts = [];
+  var cursor = 0;
+  var slices = Math.min(4, Math.max(2, Math.floor(s.length / 4)));
+  for (var i = 0; i < slices - 1; i++) {
+    var remaining = s.length - cursor;
+    var take = Math.max(1, randInt(1, Math.floor(remaining * 2 / (slices - i))));
+    take = Math.min(take, remaining - (slices - i - 1));
+    parts.push(s.slice(cursor, cursor + take));
+    cursor += take;
+  }
+  parts.push(s.slice(cursor));
+  return parts.map(function (p) {
+    return '"' + p.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+  }).join(" .. ");
+}
+
+// ── Ultra renderer — 6 encode layers + CFF flattening ─────────────────────
+function renderUltra(srcBytes, report) {
+  var LAYERS = 6;
+  var keys = [], steps = [];
+  for (var li = 0; li < LAYERS; li++) { keys.push(randInt(1, 255)); steps.push(randInt(1, 255)); }
+
+  var stages = [srcBytes];
+  for (var li2 = 0; li2 < LAYERS; li2++) stages.push(encodeLayer(stages[li2], keys[li2], steps[li2]));
+  var finalBytes = stages[LAYERS];
+
+  var minChunk = 32, maxChunk = 100;
+  var chunks = [], cursor = 0;
+  while (cursor < finalBytes.length) {
+    var size = randInt(minChunk, maxChunk);
+    var end = Math.min(cursor + size, finalBytes.length);
+    chunks.push(finalBytes.slice(cursor, end));
+    cursor = end;
+  }
+  var order = shuffledIndices(chunks.length);
+  var physSlot = new Array(chunks.length);
+  var literals = [];
+  for (var i = 0; i < order.length; i++) {
+    var logical = order[i];
+    physSlot[logical] = i + 1;
+    literals.push(bytesToLuaString(chunks[logical], 0, chunks[logical].length));
+  }
+
+  var used = new Set();
+  var vChunks  = uglyName(used), vOrder   = uglyName(used);
+  var vEncoded = uglyName(used), vDecode  = uglyName(used);
+  var vInput   = uglyName(used), vKey     = uglyName(used);
+  var vStep    = uglyName(used), vExpected= uglyName(used);
+  var vOut     = uglyName(used), vPc      = uglyName(used);
+  var vIdx     = uglyName(used), vByte    = uglyName(used);
+  var vDecoded = uglyName(used), vCheck   = uglyName(used);
+  var vState   = uglyName(used), tag      = uglyName(used);
+  var stageVars = [];
+  for (var sv = 0; sv < LAYERS; sv++) stageVars.push(uglyName(used));
+  var vLoader = uglyName(used), vErr = uglyName(used);
+
+  var orderEntries = [];
+  for (var oi = 0; oi < physSlot.length; oi++)
+    orderEntries.push("[" + (oi + 1) + "]=" + physSlot[oi]);
+
+  var out = ["-- protected by Air Obfuscator | Ultra (6-layer, flattened)"];
+  out = out.concat(junkLines(used, randInt(3, 6)));
+  out = out.concat(spreadAntiTamper(buildAntiTamperPrelude(used), used));
+  out = out.concat(junkLines(used, randInt(16, 28)));
+  // extra decoy functions — the hallmark of the Ultra tier
+  out = out.concat(decoyFunctions(used, randInt(4, 7)));
+  out = out.concat(junkLines(used, randInt(4, 8)));
+  // extra junk string tables
+  for (var dt = 0, dtn = randInt(3, 5); dt < dtn; dt++) {
+    var tname = uglyName(used), entries = [];
+    for (var de = 0, den = randInt(4, 10); de < den; de++) {
+      var junk = "";
+      for (var jc = 0, jcn = randInt(8, 24); jc < jcn; jc++)
+        junk += String.fromCharCode(randInt(33, 126));
+      junk = junk.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      entries.push('"' + junk + '"');
+    }
+    out.push("local " + tname + " = {" + entries.join(",") + "}");
+  }
+
+  out.push("local " + vChunks  + " = {" + literals.join(",") + "}");
+  out.push("local " + vOrder   + " = {" + orderEntries.join(",") + "}");
+
+  // decode function (same shape as renderComplex)
+  out.push("local function " + vDecode + "(" + vInput + "," + vKey + "," + vStep + "," + vExpected + ")");
+  out.push("  local " + vOut + " = {} local " + vCheck + " = 0 local " + vPc + " = 1");
+  out.push("  while " + vPc + " <= #" + vInput + " do");
+  out.push("    local " + vIdx + " = (" + vPc + " + 1) / 2");
+  out.push("    local " + vByte + " = (string.byte(" + vInput + "," + vPc + ") - 33) * 94 + string.byte(" + vInput + "," + vPc + " + 1) - 33");
+  out.push("    local " + vDecoded + " = (" + vByte + " - " + vKey + " - " + vStep + " * " + vIdx + ") % 256");
+  out.push("    " + vCheck + " = (" + vCheck + " + " + vDecoded + " * ((" + vIdx + " % 251) + 1)) % 2147483647");
+  out.push("    " + vOut + "[#" + vOut + " + 1] = string.char(" + vDecoded + ")");
+  out.push("    " + vPc + " = " + vPc + " + 2");
+  out.push("  end");
+  out.push("  if " + vCheck + " ~= " + vExpected + " then error('[ar] " + tag + " integrity check failed', 0) end");
+  out.push("  return table.concat(" + vOut + ")");
+  out.push("end");
+
+  // extra decoy functions interleaved again — deeper obfuscation depth
+  out = out.concat(decoyFunctions(used, randInt(3, 5)));
+
+  var assemble = [];
+  for (var ai = 0; ai < physSlot.length; ai++)
+    assemble.push(vChunks + "[" + vOrder + "[" + (ai + 1) + "]]");
+  var reassembleStmt = "    " + vEncoded + " = table.concat({" + assemble.join(",") + "})";
+
+  // 6 decode steps (outer → inner)
+  var decodeBodies = [];
+  var prev = vEncoded;
+  for (var layerIdx = LAYERS - 1; layerIdx >= 0; layerIdx--) {
+    var ovar = stageVars[LAYERS - 1 - layerIdx];
+    decodeBodies.push("    " + ovar + " = " + vDecode + "(" + prev + "," + numExpr(keys[layerIdx]) + "," + numExpr(steps[layerIdx]) + "," + numExpr(checksumOf(stages[layerIdx])) + ")");
+    prev = ovar;
+  }
+  var sourceVar = stageVars[LAYERS - 1];
+
+  var bodies = [reassembleStmt]
+    .concat(decodeBodies)
+    .concat([
+      "    if #" + sourceVar + " ~= " + numExpr(srcBytes.length) + " then error('[ar] decoded source length mismatch', 0) end",
+      "    " + vLoader + ", " + vErr + " = (loadstring or load)(" + sourceVar + ")",
+      "    if not " + vLoader + " then error('[ar] compile failed: ' .. tostring(" + vErr + "), 0) end",
+      "    return " + vLoader + "()",
+    ]);
+
+  var n = bodies.length;
+  var stateIds = randomDistinctInts(n, 1000, 999999);
+  var emitOrder = shuffledIndices(n);
+  var terminalIndex = n - 1;
+
+  var hoisted = [vEncoded].concat(stageVars).concat([vLoader, vErr]);
+  out.push("local " + hoisted.join(", "));
+  out.push("local " + vState + " = " + numExpr(stateIds[0]));
+  out.push("while " + vState + " ~= 0 do");
+  for (var k = 0; k < n; k++) {
+    var log2 = emitOrder[k];
+    out.push((k === 0 ? "  if " : "  elseif ") + vState + " == " + numExpr(stateIds[log2]) + " then");
+    out.push(bodies[log2]);
+    if (log2 !== terminalIndex) {
+      var nxt = log2 + 1 < n ? stateIds[log2 + 1] : 0;
+      out.push("    " + vState + " = " + numExpr(nxt));
+    }
+  }
+  out.push("  end");
+  out.push("end");
+
+  if (report) report(0.9, "Building 6-layer Ultra decoder...");
+  return out.join("\n");
+}
+
+// ── Patch obfuscate() to support "ultra" mode ──────────────────────────────
+(function () {
+  var _origObf = ObfuscateCore.obfuscate;
+  ObfuscateCore.obfuscate = function obfuscatePlus(srcBytes, report, mode) {
+    if (mode === "ultra") {
+      report(0.02, "Encrypting strings and numbers...");
+      var srcText = new TextDecoder().decode(srcBytes);
+      var protectedUsed = new Set();
+      var protectedText = protectLiterals(srcText, protectedUsed);
+      srcBytes = new TextEncoder().encode(protectedText);
+      report(0.05, "Encoding layer 1...");
+      report(0.15, "Encoding layer 2...");
+      report(0.28, "Encoding layer 3...");
+      report(0.42, "Encoding layer 4...");
+      report(0.55, "Encoding layer 5...");
+      report(0.68, "Encoding layer 6...");
+      report(0.78, "Splitting and shuffling chunks...");
+      var result = renderUltra(srcBytes, report);
+      report(1, "Done");
+      return result;
+    }
+    return _origObf(srcBytes, report, mode);
+  };
+})();
+
+// expose new helpers for external callers (app.js / worker.js)
+self.ObfuscateCore.decoyFunctions = decoyFunctions;
+self.ObfuscateCore.fakeEnvBlock   = fakeEnvBlock;
+self.ObfuscateCore.strBlend       = strBlend;
